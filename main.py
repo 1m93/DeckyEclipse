@@ -19,7 +19,8 @@ sys.path.insert(0, os.path.join(decky.DECKY_PLUGIN_DIR, "py_modules"))
 from eclipse import LAUNCHER_LOG, SETTINGS_FILE  # noqa: E402
 from eclipse import FLATPAK_MOONLIGHT, FLATPAK_SUNSHINE  # noqa: E402
 from eclipse import diagnostics, display, flatpak, host_display, launch, moonlight, network, updates  # noqa: E402
-from eclipse import sunshine_native  # noqa: E402
+from eclipse import proc, sunshine_data, sunshine_native  # noqa: E402
+from eclipse.sunshine_session import AutoOff, SessionTracker  # noqa: E402
 from eclipse.log import set_logger  # noqa: E402
 from eclipse.moonlight_config import MoonlightConfig, find_boxart  # noqa: E402
 from eclipse.presets import AUTO_PRESET, CUSTOM_PRESET, INHERIT_PRESET, all_presets, effective_stream  # noqa: E402
@@ -34,6 +35,13 @@ PROBE_CACHE_S = 3.0
 # Minimum time between install progress events sent to the frontend.
 PROGRESS_INTERVAL_S = 0.5
 LOG_TAIL_LINES = 200
+# How often the Sunshine on this device is checked for streaming sessions.
+SESSION_POLL_S = 3.0
+SESSION_IDLE_POLL_S = 10.0
+SESSION_EVENT = "eclipse_sunshine_session"
+# Probes in a row Sunshine must miss before it counts as stopped.
+SESSION_MISSES_OFFLINE = 2
+AUTO_OFF_EVENT = "eclipse_sunshine_auto_off"
 # Block elements flatpak uses to draw progress bars.
 _BAR_CHARS = re.compile(r"[\u2580-\u259f]+")
 
@@ -65,6 +73,13 @@ class Plugin:
     _cancellable: bool
     _pending_creds: dict[str, dict[str, Any]]
     _tasks: set[asyncio.Task]
+    _sessions: SessionTracker
+    _session_lock: asyncio.Lock
+    _session_last: Optional[dict[str, Any]]
+    _session_misses: int
+    _auto_off: AutoOff
+    # mtime of Sunshine's state file when duplicate paired devices were last looked for.
+    _state_checked: float
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -85,11 +100,18 @@ class Plugin:
         self._cancellable = True
         self._pending_creds = {}
         self._tasks = set()
+        self._sessions = SessionTracker()
+        self._session_lock = asyncio.Lock()
+        self._session_last = None
+        self._session_misses = 0
+        self._auto_off = AutoOff()
+        self._state_checked = 0.0
         log.info("Eclipse backend started (home=%s)", home)
 
         features = self.settings.data["features"]
         if features.get("sunshine") and self.settings.data["sunshine"].get("autostart"):
             self._spawn(self._autostart_sunshine())
+        self._spawn(self._watch_sunshine_sessions())
 
     async def _unload(self) -> None:
         for task in list(self._tasks):
@@ -400,6 +422,31 @@ class Plugin:
     async def stop_stream(self) -> None:
         await moonlight.kill_running(decky.DECKY_USER_HOME)
 
+    async def discover_hosts(self) -> dict[str, Any]:
+        """PCs running Sunshine on the local network, for Add host. Marks the ones already added."""
+        local = [
+            entry for entry in await diagnostics.local_ipv4(decky.DECKY_USER_HOME)
+            if not entry["interface"].startswith(diagnostics.VIRTUAL_IFACES)
+        ]
+        found = await network.discover(local[:2])
+        known = {host["uuid"] for host in self._hosts()}
+        own_ids = set()
+        if self.settings.data["features"].get("sunshine"):
+            web_port = int(self.settings.data["sunshine"].get("port") or 47990)
+            own = await network.probe("127.0.0.1", web_port - 1, timeout=0.5)
+            if own and own.get("uniqueId"):
+                own_ids.add(own["uniqueId"])
+        items = [
+            {
+                "address": info["address"],
+                "name": info.get("hostname") or info["address"],
+                "known": info.get("uniqueId") in known,
+            }
+            for info in found
+            if info.get("uniqueId") not in own_ids
+        ]
+        return {"ok": True, "error": None, "items": items, "scanned": bool(local)}
+
     async def detect_host_displays(self, uuid: str) -> dict[str, Any]:
         """List the host's displays from its Sunshine log (needs credentials)."""
         host = self._find_host(uuid)
@@ -458,6 +505,31 @@ class Plugin:
         if not api:
             return {"ok": False, "current": None, "error": "Set the host's Sunshine credentials first"}
         return await asyncio.to_thread(host_display.current_output, api)
+
+    async def host_diagnostics(self, uuid: str) -> dict[str, Any]:
+        """Checks explaining why streaming from a host fails."""
+        host = self._find_host(uuid)
+        if not host:
+            return {"ok": False, "error": "Unknown host", "checks": []}
+        api = self._sunshine_api_for(host)
+        info, local, resolved = await asyncio.gather(
+            network.probe_any(host["addresses"], timeout=2.0),
+            diagnostics.local_ipv4(decky.DECKY_USER_HOME),
+            self._resolve_moonlight(force=True),
+        )
+        if info and info.get("mac"):
+            # Same as a regular probe: remember the MAC for Wake-on-LAN.
+            self._probe_cache[uuid] = info
+        login = (await api.test()) if api and info else None
+        checks = diagnostics.host_checks(
+            host, info, bool(resolved.get("installed")), local, self._host_mac(host), login if api else None,
+        )
+        if api and not info:
+            # Cannot be checked while the PC does not answer.
+            for check in checks:
+                if check["id"] == "login":
+                    check.update({"label": "The PC's Sunshine login works", "ok": None, "hint": "Checked once the PC answers."})
+        return {"ok": True, "error": None, "checks": checks}
 
     async def test_host_credentials(self, uuid: str) -> dict[str, Any]:
         host = self._find_host(uuid)
@@ -722,6 +794,32 @@ class Plugin:
 
         return await self._install(feature, job, "uninstall")
 
+    # ------------------------------------------------------------------ SteamOS password
+
+    def _passwd_cmd(self) -> list[str]:
+        return [proc.which("passwd", decky.DECKY_USER_HOME) or "/usr/bin/passwd"]
+
+    async def sudo_password_state(self) -> dict[str, Any]:
+        """Whether this device's user has a password, which sudo needs: "set", "none" or "unknown"."""
+        # Imported on use: a module missing from Decky's Python must not stop the plugin.
+        from eclipse import account
+
+        env = proc.clean_env(decky.DECKY_USER_HOME)
+        state = await asyncio.to_thread(account.password_state, self._passwd_cmd(), env)
+        return {"state": state}
+
+    async def create_sudo_password(self, password: str) -> dict[str, Any]:
+        """Set the first password of this device's user (only when none is set yet)."""
+        from eclipse import account
+
+        env = proc.clean_env(decky.DECKY_USER_HOME)
+        error = await asyncio.to_thread(account.set_first_password, password or "", self._passwd_cmd(), env)
+        if error:
+            log.info("Setting the SteamOS password failed: %s", error)
+        else:
+            log.info("SteamOS password set")
+        return {"ok": error is None, "error": error}
+
     # ------------------------------------------------------------------ plugin updates
 
     async def check_plugin_update(self) -> dict[str, Any]:
@@ -744,6 +842,122 @@ class Plugin:
         if status["installed"] and not status["running"]:
             result = await self.local_sunshine.start()
             log.info("Sunshine autostart: %s", "started" if result["ok"] else result["error"])
+
+    async def _session_state(self) -> dict[str, Any]:
+        """Streaming sessions of the Sunshine on this device (see sunshine_session.py)."""
+        async with self._session_lock:
+            # Sunshine's HTTP (pairing/serverinfo) port is the web UI port minus one.
+            web_port = int(self.settings.data["sunshine"].get("port") or 47990)
+            server = await network.probe("127.0.0.1", web_port - 1, timeout=1.5)
+            if server:
+                self._session_misses = 0
+            else:
+                self._session_misses += 1
+                # A busy Sunshine can miss one probe; that is not the end of a stream.
+                if self._session_last and self._session_misses < SESSION_MISSES_OFFLINE:
+                    return self._session_last
+            log_path = diagnostics.sunshine_log_path(decky.DECKY_USER_HOME)
+            state = await asyncio.to_thread(self._sessions.update, server, log_path)
+            self._session_last = state
+            return state
+
+    async def _watch_sunshine_sessions(self) -> None:
+        """Tell the frontend when a device starts or stops streaming from here, even with the UI closed."""
+        last: Optional[tuple[Any, ...]] = None
+        while True:
+            enabled = bool(self.settings.data["features"].get("sunshine"))
+            try:
+                state = await self._session_state() if enabled else None
+                key = (state["clients"], state["appOpen"], state["appName"], state["reachable"]) if state else None
+                if key != last:
+                    last = key
+                    if state:
+                        await self._emit(SESSION_EVENT, state)
+                if state:
+                    await self._apply_auto_off(state)
+                    if state["reachable"]:
+                        await self._drop_duplicate_clients()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - the watcher must keep running
+                log.exception("Sunshine session check failed")
+            await asyncio.sleep(SESSION_POLL_S if enabled else SESSION_IDLE_POLL_S)
+
+    async def _drop_duplicate_clients(self) -> None:
+        """Sunshine 2026.914 keeps the old record when a device pairs again, and then rejects
+        that device (Error 401). Remove the older records as soon as the state file changes."""
+        path = sunshine_data.state_path(decky.DECKY_USER_HOME)
+        try:
+            mtime = os.stat(path).st_mtime
+        except OSError:
+            return
+        if mtime == self._state_checked:
+            return
+        api = self._local_api()
+        if not api:
+            return  # Retried once a login is saved; fixed at the next start meanwhile.
+        state = await asyncio.to_thread(sunshine_data.read_state, path)
+        duplicates = sunshine_data.duplicate_clients(state) if state else []
+        failed = False
+        for uuid in duplicates:
+            result = await api.unpair(uuid)
+            if result["ok"]:
+                log.info("Removed a duplicate paired-device record (%s)", uuid)
+            else:
+                failed = True
+                log.warning("Could not remove a duplicate paired-device record: %s", result["error"])
+        if not failed:
+            # Unpairing rewrites the file: that new mtime is checked once more, finding nothing.
+            self._state_checked = mtime
+
+    async def _apply_auto_off(self, state: dict[str, Any]) -> None:
+        option = str(self.settings.data["sunshine"].get("autoOff") or "never")
+        reason = self._auto_off.update(state, option, time.monotonic())
+        # Never in the middle of an install or update of Sunshine.
+        if not reason or self._installing:
+            return
+        log.info("Turning Sunshine off: %s", reason)
+        self._auto_off.reset()
+        result = await self.local_sunshine.stop()
+        if result["ok"]:
+            await self._emit(AUTO_OFF_EVENT, f"Sunshine turned off: {reason}.")
+
+    async def sunshine_session(self) -> dict[str, Any]:
+        return await self._session_state()
+
+    async def sunshine_end_session(self, restart: bool = False) -> dict[str, Any]:
+        """End every stream from this device.
+
+        Without ``restart``, the open app is closed through Sunshine's API with
+        the saved login, which disconnects its clients. When that is not
+        possible, ``needsRestart`` asks the user to allow a restart instead.
+        With ``restart``, Sunshine is restarted, which drops every connection.
+        """
+        if not restart:
+            api = self._local_api()
+            if not api:
+                return {"ok": False, "error": None, "method": "closed", "needsRestart": True}
+            result = await api.close_app()
+            if result["ok"]:
+                return {"ok": True, "error": None, "method": "closed"}
+            log.info("Closing the Sunshine app failed: %s", result["error"])
+            return {"ok": False, "error": result["error"], "method": "closed", "needsRestart": True}
+        await self.local_sunshine.stop()
+        # Let the ports free up before starting again.
+        await asyncio.sleep(1.0)
+        result = await self.local_sunshine.start()
+        return {"ok": result["ok"], "error": result["error"], "method": "restarted"}
+
+    async def sunshine_overview(self) -> dict[str, Any]:
+        """What the Quick Access menu shows about sharing: this device's address and paired devices."""
+        addresses = await diagnostics.local_ipv4(decky.DECKY_USER_HOME)
+        api = self._local_api()
+        paired: Optional[int] = None
+        if api:
+            clients = await api.clients()
+            if clients["ok"]:
+                paired = len(clients["items"])
+        return {"address": addresses[0]["address"] if addresses else None, "paired": paired}
 
     async def sunshine_status(self) -> dict[str, Any]:
         status = await self.local_sunshine.status()
@@ -802,6 +1016,27 @@ class Plugin:
         if result["ok"]:
             self.settings.update({"sunshine": {"user": user, "password": password}})
         return {"ok": result["ok"], "error": result["error"]}
+
+    async def sunshine_create_login_auto(self) -> dict[str, Any]:
+        """Create the first Sunshine login with a generated password, so nothing has to be typed.
+
+        The login is returned once, for the user to note for Sunshine's web page.
+        """
+        user = getattr(decky, "DECKY_USER", None) or "deck"
+        # Easy to type on another device: no look-alike characters, in groups.
+        alphabet = "abcdefghjkmnpqrstuvwxyz23456789"
+        password = "-".join("".join(secrets.choice(alphabet) for _ in range(4)) for _ in range(3))
+        result = await self.sunshine_create_login(user, password)
+        if not result["ok"]:
+            return {"ok": False, "error": result["error"], "user": None, "password": None}
+        return {"ok": True, "error": None, "user": user, "password": password}
+
+    async def sunshine_reveal_login(self) -> dict[str, Any]:
+        """The saved Sunshine login, on the user's explicit request (to open Sunshine's web page)."""
+        cfg = self.settings.data["sunshine"]
+        if not cfg.get("user") or not cfg.get("password"):
+            return {"ok": False, "error": "No Sunshine login saved", "user": None, "password": None}
+        return {"ok": True, "error": None, "user": cfg["user"], "password": cfg["password"]}
 
     async def sunshine_test_login(self) -> dict[str, Any]:
         """Check the saved login against the Sunshine web UI on this device."""

@@ -6,7 +6,6 @@ import asyncio
 import base64
 import json
 import os
-import shutil
 import ssl
 import time
 import urllib.error
@@ -15,6 +14,7 @@ from typing import Any, Callable, Optional
 
 from . import DEFAULT_SUNSHINE_WEB_PORT, FLATPAK_SUNSHINE
 from . import flatpak, proc
+from . import sunshine_data
 from . import sunshine_native as native
 from .log import get_logger
 
@@ -338,8 +338,21 @@ class LocalSunshine:
         state = self.native_state() if info["kind"] == "eclipse" else None
         return {**info, "running": running, "unitEnabled": unit_enabled, "native": state}
 
+    async def _migrate_data(self) -> None:
+        """Move legacy data back and drop duplicate paired devices. Sunshine must be stopped."""
+        if self.native_state().get("legacy"):
+            # The legacy binary still uses the legacy place until it is repaired.
+            return
+        for line in await asyncio.to_thread(sunshine_data.migrate, self.home):
+            get_logger().info(line)
+
     async def start(self) -> dict[str, Any]:
         info = await self.detect()
+        if info["kind"] == "eclipse" and not proc.find_processes(_PROCESS_NAMES):
+            try:
+                await self._migrate_data()
+            except OSError as exc:
+                get_logger().warning("Could not tidy Sunshine's data before starting: %s", exc)
         if info["kind"] == "eclipse" and info["flatpak"]:
             # Both would use the same ports.
             await proc.run(["flatpak", "kill", FLATPAK_SUNSHINE], timeout=10, home=self.home)
@@ -449,6 +462,8 @@ class LocalSunshine:
         await self._write_unit()
         warning = None
         try:
+            # Before the config is adjusted: the user's own config may still be in the legacy place.
+            await self._migrate_data()
             await asyncio.to_thread(self._prepare_config)
         except OSError as exc:
             warning = f"Sunshine is installed, but its config could not be updated: {exc}"
@@ -464,7 +479,7 @@ class LocalSunshine:
 
     async def repair(self, password: str, on_line: Callable[[str], None]) -> dict[str, Any]:
         """Reinstall the installed version: restores the capability and updates the helpers."""
-        tag = native.read_manifest().get("tag")
+        tag = native.installed_manifest().get("tag")
         return await self.install(password, on_line, tag if isinstance(tag, str) and native.TAG_RE.match(tag) else None)
 
     async def uninstall(self, password: str, on_line: Callable[[str], None], delete_data: bool) -> dict[str, Any]:
@@ -481,7 +496,7 @@ class LocalSunshine:
             pass
         await self._systemctl("daemon-reload")
         if delete_data:
-            await asyncio.to_thread(shutil.rmtree, os.path.dirname(self.config_path), True)
+            await asyncio.to_thread(sunshine_data.remove_all, self.home)
         self.invalidate()
         return {"ok": True, "error": None, "warning": None}
 

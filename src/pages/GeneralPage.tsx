@@ -86,6 +86,12 @@ function MoonlightSettings({ settings }: { settings: Settings }) {
       <DialogControlsSection>
         <DialogControlsSectionHeader>Interface</DialogControlsSectionHeader>
         <ToggleField
+          label="Ask before closing the game on the host"
+          description="When End stream also closes the game on the host, confirm first, since unsaved progress there may be lost."
+          checked={behavior.confirmEndStream}
+          onChange={(checked) => updateSettings({ behavior: { confirmEndStream: checked } })}
+        />
+        <ToggleField
           label="Show offline hosts"
           checked={behavior.showOffline}
           onChange={(checked) => updateSettings({ behavior: { showOffline: checked } })}
@@ -150,20 +156,32 @@ export function GeneralPage() {
       <DialogControlsSection>
         <DialogControlsSectionHeader>Features</DialogControlsSectionHeader>
         <ToggleField
-          label="Play games from a PC (Moonlight)"
-          description="Show hosts and streaming controls. Moonlight is only installed when you ask for it."
+          label="Play: stream games from a PC (Moonlight)"
+          description="Hosts and streaming controls. Moonlight is only installed when you ask for it."
           checked={features.moonlight}
           onChange={(checked) => toggleFeature("moonlight", checked)}
         />
         <ToggleField
-          label="Share this device's games (Sunshine)"
-          description="Show controls for a Sunshine server on this device. Turning this off also turns off autostart."
+          label="Share: let other devices stream from here (Sunshine)"
+          description="Controls for a Sunshine server on this device. Turning this off also turns off its autostart."
           checked={features.sunshine}
           onChange={(checked) => toggleFeature("sunshine", checked)}
         />
       </DialogControlsSection>
 
       <AppsSection />
+
+      {features.sunshine && (
+        <DialogControlsSection>
+          <DialogControlsSectionHeader>Notifications</DialogControlsSectionHeader>
+          <ToggleField
+            label="When a device streams from here"
+            description="Notify when another device starts or stops streaming from this one, even with the Quick Access menu closed."
+            checked={settings.sunshine.notifySessions}
+            onChange={(checked) => updateSettings({ sunshine: { notifySessions: checked } }, 0)}
+          />
+        </DialogControlsSection>
+      )}
 
       {features.moonlight && <MoonlightSettings settings={settings} />}
     </>

@@ -3,7 +3,6 @@ import { useCallback, useEffect, useState } from "react";
 import { FaCheckCircle, FaQuestionCircle, FaTimesCircle } from "react-icons/fa";
 import { backend } from "../backend";
 import type { DiagnosticCheck, SunshineDiagnostics } from "../types";
-import { LogViewer } from "./LogViewer";
 
 function CheckIcon({ ok }: { ok: boolean | null }) {
   if (ok === true) return <FaCheckCircle color="#5ba32b" style={{ flexShrink: 0 }} />;
@@ -11,7 +10,7 @@ function CheckIcon({ ok }: { ok: boolean | null }) {
   return <FaQuestionCircle color="#8b929a" style={{ flexShrink: 0 }} />;
 }
 
-function CheckRow({ check }: { check: DiagnosticCheck }) {
+export function CheckRow({ check }: { check: DiagnosticCheck }) {
   const text = check.ok === false ? check.hint || check.detail : check.detail || (check.ok === null ? check.hint : "");
   return (
     <Field
@@ -29,14 +28,13 @@ function CheckRow({ check }: { check: DiagnosticCheck }) {
 
 /**
  * Helps another device find and reach Sunshine here: the address to type in
- * Moonlight, checks for the usual causes, and Sunshine's own log.
+ * Moonlight and checks for the usual causes.
  * `refreshKey` re-runs the checks (e.g. after Sunshine was started);
  * `paused` holds them while a start/stop is still in progress.
  */
 export function SunshineConnectSection({ refreshKey, paused = false }: { refreshKey: unknown; paused?: boolean }) {
   const [result, setResult] = useState<SunshineDiagnostics | null>(null);
   const [running, setRunning] = useState(false);
-  const [showLog, setShowLog] = useState(false);
 
   const runChecks = useCallback(async () => {
     setRunning(true);
@@ -56,7 +54,7 @@ export function SunshineConnectSection({ refreshKey, paused = false }: { refresh
 
   return (
     <DialogControlsSection>
-      <DialogControlsSectionHeader>Connect from another device</DialogControlsSectionHeader>
+      <DialogControlsSectionHeader>Sharing: connection checks</DialogControlsSectionHeader>
       <Field
         label={address ? `This device: ${address}` : "This device has no network address"}
         description={
@@ -83,10 +81,6 @@ export function SunshineConnectSection({ refreshKey, paused = false }: { refresh
       >
         {running ? "Checking..." : "Run checks again"}
       </ButtonItem>
-      <ButtonItem layout="below" onClick={() => setShowLog((v) => !v)}>
-        {showLog ? "Hide Sunshine log" : "Show Sunshine log"}
-      </ButtonItem>
-      {showLog && <LogViewer initialSource="sunshine" />}
     </DialogControlsSection>
   );
 }

@@ -137,7 +137,7 @@ function HostDetails({ host }: { host: Host }) {
       </DialogControlsSection>
 
       <DialogControlsSection>
-        <DialogControlsSectionHeader>Sunshine login</DialogControlsSectionHeader>
+        <DialogControlsSectionHeader>This host's Sunshine login</DialogControlsSectionHeader>
         <Field
           label={hasLogin ? `Connected as ${cfg.sunshineUser}` : "Not connected"}
           description="Optional. With the login of Sunshine's web page on the host, Eclipse can switch monitors, enter pairing PINs and close host apps from Gaming Mode."
@@ -196,11 +196,12 @@ function HostDetails({ host }: { host: Host }) {
 export function HostsPage() {
   const hosts = useStore((s) => s.hosts);
   const target = useStore((s) => s.pageTarget.host);
+  const nonce = useStore((s) => s.pageTarget.nonce);
   const [selected, setSelected] = useState<string | null>(target ?? hosts[0]?.uuid ?? null);
 
   useEffect(() => {
     if (target) setSelected(target);
-  }, [target]);
+  }, [target, nonce]);
 
   const host = hosts.find((h) => h.uuid === selected) ?? hosts[0];
   const options = useMemo(() => hosts.map((h) => ({ data: h.uuid, label: h.name })), [hosts]);

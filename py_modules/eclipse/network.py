@@ -189,3 +189,45 @@ def send_wol(mac: str, address_hints: Optional[list[str]] = None) -> bool:
                 except OSError:
                     continue
     return sent
+
+
+# Addresses scanned per network at most: a /24, which covers home networks.
+_SCAN_PREFIX = 24
+_SCAN_CONCURRENCY = 64
+
+
+def scan_targets(local: list[dict[str, str]]) -> list[str]:
+    """Addresses to look for hosts at: the /24 (or smaller) network of each local address, minus our own."""
+    own = {entry["address"] for entry in local}
+    targets: list[str] = []
+    seen_networks = set()
+    for entry in local:
+        try:
+            prefix = max(_SCAN_PREFIX, int(entry.get("prefix") or _SCAN_PREFIX))
+            network = ipaddress.ip_network(f"{entry['address']}/{prefix}", strict=False)
+        except ValueError:
+            continue
+        if network in seen_networks or not network.is_private:
+            continue
+        seen_networks.add(network)
+        targets += [str(ip) for ip in network.hosts() if str(ip) not in own]
+    return targets
+
+
+async def discover(local: list[dict[str, str]], timeout: float = 0.8) -> list[dict[str, Any]]:
+    """Sunshine (or GameStream) hosts answering ``/serverinfo`` on the local networks."""
+    semaphore = asyncio.Semaphore(_SCAN_CONCURRENCY)
+
+    async def check(address: str) -> Optional[dict[str, Any]]:
+        async with semaphore:
+            return await probe(address, DEFAULT_HTTP_PORT, timeout)
+
+    results = await asyncio.gather(*(check(address) for address in scan_targets(local)))
+    found: dict[str, dict[str, Any]] = {}
+    for info in results:
+        if not info:
+            continue
+        # A host with several addresses answers on each of them: list it once.
+        key = info.get("uniqueId") or info["address"]
+        found.setdefault(key, info)
+    return sorted(found.values(), key=lambda info: (info.get("hostname") or "").lower())

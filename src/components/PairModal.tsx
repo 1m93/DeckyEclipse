@@ -28,6 +28,11 @@ function PairModal({ address, host, creds = null, closeModal }: Props) {
   }, [address, host, creds]);
 
   const target = host?.name ?? address;
+  // A typed address may carry Moonlight's port ("192.168.1.20:47989"); the web page has its own.
+  const rawAddress = address || host?.addresses[0]?.address || "the-pc-address";
+  const parts = rawAddress.split(":");
+  const webAddress =
+    parts.length === 2 ? parts[0] : parts.length > 2 && !rawAddress.startsWith("[") ? `[${rawAddress}]` : rawAddress;
 
   return (
     <ConfirmModal
@@ -54,8 +59,9 @@ function PairModal({ address, host, creds = null, closeModal }: Props) {
             </div>
           ) : (
             <div style={{ textAlign: "center" }}>
-              On the host, open the Sunshine web UI (https://&lt;host&gt;:47990), go to <b>PIN</b> and enter this
-              code. Moonlight will open and wait for it. The PIN also stays visible as a notification.
+              On the PC, open <b>https://{webAddress}:47990</b> in a browser (accept the certificate warning), go
+              to <b>PIN</b> and enter this code. Moonlight will open and wait for it. The PIN also stays visible as a
+              notification.
             </div>
           )}
         </div>

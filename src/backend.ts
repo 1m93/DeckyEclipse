@@ -2,7 +2,10 @@ import { callable } from "@decky/api";
 import type {
   AppsStatus,
   AppUpdateCheck,
+  DiagnosticCheck,
+  DiscoveredHost,
   DisplayInfo,
+  EndSessionResult,
   Feature,
   Host,
   HostConfig,
@@ -26,6 +29,8 @@ import type {
   StreamPrepareResult,
   SunshineDiagnostics,
   SunshineLoginState,
+  SunshineOverview,
+  SunshineSession,
   SunshineStatus,
 } from "./types";
 
@@ -40,6 +45,7 @@ export const backend = {
     "set_host_config",
   ),
   refreshMoonlight: callable<[], MoonlightInfo>("refresh_moonlight"),
+  discoverHosts: callable<[], Result & { items: DiscoveredHost[]; scanned: boolean }>("discover_hosts"),
 
   wakeHost: callable<[uuid: string], Result>("wake_host"),
   prepareStream: callable<[uuid: string, appName: string], StreamPrepareResult>("prepare_stream"),
@@ -52,6 +58,7 @@ export const backend = {
   stopStream: callable<[], void>("stop_stream"),
   quitAfterStream: callable<[uuid: string], QuitResult>("quit_after_stream"),
   testHostCredentials: callable<[uuid: string], Result>("test_host_credentials"),
+  hostDiagnostics: callable<[uuid: string], Result & { checks: DiagnosticCheck[] }>("host_diagnostics"),
   detectHostDisplays: callable<[uuid: string], Result & { displays: HostDisplay[] }>("detect_host_displays"),
   hostCurrentDisplay: callable<[uuid: string], Result & { current: string | null }>("host_current_display"),
   refreshHostMonitors: callable<[uuid: string, rescan: boolean], MonitorRefresh>("refresh_host_monitors"),
@@ -74,6 +81,8 @@ export const backend = {
     "uninstall_app",
   ),
   checkPluginUpdate: callable<[], PluginUpdateCheck>("check_plugin_update"),
+  sudoPasswordState: callable<[], { state: "set" | "none" | "unknown" }>("sudo_password_state"),
+  createSudoPassword: callable<[password: string], Result>("create_sudo_password"),
 
   sunshineStatus: callable<[], SunshineStatus>("sunshine_status"),
   sunshineStart: callable<[], Result>("sunshine_start"),
@@ -91,7 +100,15 @@ export const backend = {
   sunshineTestLogin: callable<[], Result>("sunshine_test_login"),
   sunshineLoginState: callable<[], { state: SunshineLoginState; error: string | null }>("sunshine_login_state"),
   sunshineCreateLogin: callable<[user: string, password: string], Result>("sunshine_create_login"),
+  sunshineCreateLoginAuto: callable<[], Result & { user: string | null; password: string | null }>(
+    "sunshine_create_login_auto",
+  ),
+  sunshineRevealLogin: callable<[], Result & { user: string | null; password: string | null }>("sunshine_reveal_login"),
   sunshineDiagnostics: callable<[], SunshineDiagnostics>("sunshine_diagnostics"),
+  sunshineSession: callable<[], SunshineSession>("sunshine_session"),
+  /** `restart`: restart Sunshine instead of closing the open app. */
+  sunshineEndSession: callable<[restart: boolean], EndSessionResult>("sunshine_end_session"),
+  sunshineOverview: callable<[], SunshineOverview>("sunshine_overview"),
   getSunshineLog: callable<[], string>("get_sunshine_log"),
 
   getLauncherLog: callable<[], string>("get_launcher_log"),
@@ -104,4 +121,6 @@ export const Events = {
   wakeProgress: "eclipse_wake_progress",
   pairResult: "eclipse_pair_result",
   streamProgress: "eclipse_stream_progress",
+  sunshineSession: "eclipse_sunshine_session",
+  sunshineAutoOff: "eclipse_sunshine_auto_off",
 } as const;

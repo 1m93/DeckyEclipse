@@ -42,12 +42,19 @@ DEFAULTS: dict[str, Any] = {
         # Start Sunshine when the plugin loads (and enable its user service).
         # Off by default: Sunshine then only runs when started manually.
         "autostart": False,
+        # Toast when another device starts or stops streaming from this one.
+        "notifySessions": True,
+        # Turn Sunshine off when nobody streams: "never", "afterStream" (a minute
+        # after the last device left) or a number of idle minutes ("15", "30", "60").
+        "autoOff": "never",
     },
     "behavior": {
         "autoWake": True,
         "wakeTimeoutS": 90,
         "showOffline": True,
         "pollIntervalS": 8,
+        # Ask before End stream closes the game on the host.
+        "confirmEndStream": True,
     },
     "updates": {
         # Check GitHub for a new plugin release at most once a day.

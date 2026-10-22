@@ -14,6 +14,8 @@ import type {
   Settings,
   StreamSession,
   StreamSettings,
+  SunshineOverview,
+  SunshineSession,
 } from "../types";
 import { deepMerge, mergePatches } from "./merge";
 
@@ -25,6 +27,9 @@ export interface MonitorState {
   detectedAt: string | null;
   error: string | null;
 }
+
+/** Tab of the Quick Access menu: streaming from a PC, or sharing this device. */
+export type QuickTab = "play" | "share";
 
 export interface State {
   ready: boolean;
@@ -55,7 +60,26 @@ export interface State {
   /** Live monitor info per host uuid, refreshed when it matters. */
   monitors: Record<string, MonitorState>;
   /** Page and host the full settings page should open on. */
-  pageTarget: { page: string; host: string | null };
+  /** `nonce` changes on every request, so asking for the same host again still applies. */
+  pageTarget: { page: string; host: string | null; log?: string | null; nonce: number };
+  /** Streams from the Sunshine on this device, pushed by the backend. */
+  incoming: SunshineSession | null;
+  /** Address and paired devices of the Sunshine on this device. */
+  sharing: SunshineOverview | null;
+  /** The user asked to end the streams from this device and it is under way. */
+  endingIncoming: boolean;
+  quickTab: QuickTab;
+}
+
+const QUICK_TAB_KEY = "eclipse.quickTab";
+
+/** The last Quick Access tab is a per-device convenience: storage may be unavailable. */
+function readQuickTab(): QuickTab {
+  try {
+    return window.localStorage.getItem(QUICK_TAB_KEY) === "share" ? "share" : "play";
+  } catch {
+    return "play";
+  }
 }
 
 const initialState: State = {
@@ -82,7 +106,11 @@ const initialState: State = {
   launching: null,
   launchStage: null,
   monitors: {},
-  pageTarget: { page: "hosts", host: null },
+  pageTarget: { page: "hosts", host: null, nonce: 0 },
+  incoming: null,
+  sharing: null,
+  endingIncoming: false,
+  quickTab: readQuickTab(),
 };
 
 // ---------------------------------------------------------------- core store
@@ -98,6 +126,17 @@ export function setState(patch: Partial<State> | ((prev: State) => Partial<State
   const next = typeof patch === "function" ? patch(state) : patch;
   state = { ...state, ...next };
   listeners.forEach((listener) => listener());
+}
+
+/** `remember`: the user picked it. Automatic switches do not replace the user's choice. */
+export function setQuickTab(tab: QuickTab, remember = true): void {
+  if (state.quickTab !== tab) setState({ quickTab: tab });
+  if (!remember) return;
+  try {
+    window.localStorage.setItem(QUICK_TAB_KEY, tab);
+  } catch {
+    // Not remembered, which is fine.
+  }
 }
 
 function subscribe(listener: () => void): () => void {
@@ -118,10 +157,34 @@ export function useStore<T>(selector: (s: State) => T): T {
 
 let loadPromise: Promise<void> | null = null;
 
+/** Without an answer by then, the backend most likely failed to start: say so instead of loading forever. */
+const LOAD_TIMEOUT_MS = 20000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = window.setTimeout(() => reject(new Error(message)), ms);
+    promise.then(
+      (value) => {
+        window.clearTimeout(timer);
+        resolve(value);
+      },
+      (err: unknown) => {
+        window.clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}
+
 export function loadInitialState(force = false): Promise<void> {
   if (loadPromise && !force) return loadPromise;
-  loadPromise = backend
-    .getState()
+  // Retrying after an error: show the spinner again meanwhile.
+  if (state.loadError) setState({ loadError: null });
+  loadPromise = withTimeout(
+    backend.getState(),
+    LOAD_TIMEOUT_MS,
+    "The Eclipse backend does not answer. It may have failed to start: see ~/homebrew/logs/Eclipse/ on the device, or restart Decky.",
+  )
     .then((initial) => {
       setState({
         ready: true,
@@ -143,7 +206,7 @@ export function loadInitialState(force = false): Promise<void> {
     })
     .catch((err: unknown) => {
       loadPromise = null;
-      setState({ loadError: String(err) });
+      setState({ loadError: err instanceof Error ? err.message : String(err) });
     });
   return loadPromise;
 }
@@ -175,6 +238,44 @@ export async function refreshDisplay(): Promise<void> {
 
 export function featureEnabled(s: State, feature: Feature): boolean {
   return Boolean(s.settings?.features[feature]);
+}
+
+type IncomingHandler = (prev: SunshineSession | null, next: SunshineSession) => void;
+let incomingHandler: IncomingHandler | null = null;
+
+/** Called on every change of the incoming stream state, wherever it came from (event or refresh). */
+export function setIncomingHandler(handler: IncomingHandler | null): void {
+  incomingHandler = handler;
+}
+
+export function applyIncoming(next: SunshineSession): void {
+  const prev = state.incoming;
+  if (sameJson(prev, next)) return;
+  setState({ incoming: next });
+  incomingHandler?.(prev, next);
+}
+
+/** Sync the incoming stream state, e.g. when the UI opens (events only report changes). */
+export async function refreshIncoming(): Promise<SunshineSession | null> {
+  try {
+    const incoming = await backend.sunshineSession();
+    applyIncoming(incoming);
+    return incoming;
+  } catch (err) {
+    console.error("[Eclipse] Sunshine session check failed", err);
+    return null;
+  }
+}
+
+export async function refreshSharing(): Promise<void> {
+  try {
+    const sharing = await backend.sunshineOverview();
+    setState((prev) => (sameJson(prev.sharing, sharing) ? {} : { sharing }));
+  } catch (err) {
+    console.error("[Eclipse] Sunshine overview failed", err);
+    // Show "unknown" instead of looking up forever.
+    setState((prev) => (prev.sharing ? {} : { sharing: { address: null, paired: null } }));
+  }
 }
 
 // ---------------------------------------------------------------- host status polling

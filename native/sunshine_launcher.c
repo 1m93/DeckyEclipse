@@ -13,9 +13,9 @@
  * without secure mode. Sunshine drops them from everything but its DRM worker
  * thread right after startup, so the apps it starts do not get them.
  *
- * Capabilities are only handed on when the installation is owned by root and
- * not writable by others; otherwise anyone able to replace the Sunshine
- * binary would get them.
+ * Capabilities are only handed on when the installation and its parent
+ * directory are owned by root and not writable by others; otherwise anyone
+ * able to replace the Sunshine binary (or swap the installation) would get them.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -73,7 +73,7 @@ int main(int argc, char *argv[]) {
   self[len] = '\0';
 
   /* self = <root>/bin/eclipse-sunshine */
-  char root[PATH_MAX], bin_dir[PATH_MAX], lib_dir[PATH_MAX], binary[PATH_MAX], preload[PATH_MAX];
+  char base[PATH_MAX], root[PATH_MAX], bin_dir[PATH_MAX], lib_dir[PATH_MAX], binary[PATH_MAX], preload[PATH_MAX];
   strcpy(bin_dir, self);
   char *slash = strrchr(bin_dir, '/');
   if (!slash || slash == bin_dir) {
@@ -88,6 +88,17 @@ int main(int argc, char *argv[]) {
     return 127;
   }
   *slash = '\0';
+  strcpy(base, root);
+  slash = strrchr(base, '/');
+  if (!slash) {
+    fprintf(stderr, "eclipse-sunshine: unexpected location %s\n", self);
+    return 127;
+  }
+  if (slash == base) {
+    slash[1] = '\0'; /* the parent is "/" */
+  } else {
+    *slash = '\0';
+  }
   if (snprintf(lib_dir, sizeof(lib_dir), "%s/lib", root) >= (int) sizeof(lib_dir) ||
       snprintf(binary, sizeof(binary), "%s/sunshine", bin_dir) >= (int) sizeof(binary) ||
       snprintf(preload, sizeof(preload), "%s/libeclipse-sunshine.so", lib_dir) >= (int) sizeof(preload)) {
@@ -95,7 +106,7 @@ int main(int argc, char *argv[]) {
     return 127;
   }
 
-  if (trusted(root) && trusted(bin_dir) && trusted(lib_dir) && trusted(binary) && trusted(preload)) {
+  if (trusted(base) && trusted(root) && trusted(bin_dir) && trusted(lib_dir) && trusted(binary) && trusted(preload)) {
     if (raise_ambient() != 0) {
       fprintf(stderr, "eclipse-sunshine: no CAP_SYS_ADMIN, Gaming Mode capture will fail (%s). "
                       "Repair Sunshine in Eclipse's settings.\n", strerror(errno));

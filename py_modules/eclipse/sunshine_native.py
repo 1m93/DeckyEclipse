@@ -3,14 +3,19 @@
 The Flatpak build of Sunshine cannot (KMS capture is compiled out), so Eclipse
 installs Sunshine's official Ubuntu 22.04 build instead:
 
-* Everything lives in ``ROOT``, owned by root. ``/home`` survives SteamOS
-  updates and is not mounted nosuid, so file capabilities work there.
+* Everything lives in ``ROOT``, owned by root, as is its parent ``BASE``.
+  ``/home`` survives SteamOS updates and is not mounted nosuid, so file
+  capabilities work there.
 * The Ubuntu build needs only glibc 2.35 and Qt 6.2, older than SteamOS ships.
   The two libraries SteamOS lacks are taken from Ubuntu, checked by SHA-256.
 * Sunshine reads its web UI and shaders from the compiled-in
   ``/usr/share/sunshine``, read-only on SteamOS. That prefix is replaced in
-  the binary by ``ROOT`` plus a slash: the same length, and a doubled slash is
-  harmless in a path.
+  the binary by ``ROOT``, which has the same length and also ends in
+  ``/sunshine``: the compiler stores the literal ``"sunshine"`` (the name of
+  the config directory, ``~/.config/sunshine``) in the last bytes of
+  ``"/usr/share/sunshine"``, so those bytes must not change. Earlier versions
+  used ``/home/.eclipse-sun/`` and Sunshine then kept its data in
+  ``~/.config/pse-sun``.
 * ``bin/eclipse-sunshine`` (native/sunshine_launcher.c) starts Sunshine with
   the capabilities KMS needs and preloads ``lib/libeclipse-sunshine.so``
   (native/sunshine_preload.c), which avoids the black picture of Sunshine
@@ -32,7 +37,10 @@ import subprocess
 import tarfile
 from typing import Any, Iterator, Optional
 
-ROOT = "/home/.eclipse-sun"
+BASE = "/home/.ecl"
+ROOT = BASE + "/sunshine"
+# Installations of earlier Eclipse versions, replaced by a repair.
+LEGACY_ROOTS = ("/home/.eclipse-sun",)
 BIN_DIR = ROOT + "/bin"
 LIB_DIR = ROOT + "/lib"
 LAUNCHER = BIN_DIR + "/eclipse-sunshine"
@@ -42,8 +50,15 @@ MANIFEST = ROOT + "/eclipse.json"
 HELPERS = ("eclipse-sunshine", "libeclipse-sunshine.so")
 
 ASSETS_OLD = b"/usr/share/sunshine"
-ASSETS_NEW = (ROOT + "/").encode()
+ASSETS_NEW = ROOT.encode()
 assert len(ASSETS_OLD) == len(ASSETS_NEW), "the asset prefix must keep its length"
+assert ASSETS_NEW.endswith(b"/sunshine"), "literals sharing the end of the prefix must stay intact"
+
+# Sunshine's data (login, paired devices, server certificate, apps, config),
+# relative to the user's home. The legacy one is where the binaries patched by
+# earlier versions kept it.
+CONFIG_DIR = ".config/sunshine"
+LEGACY_CONFIG_DIRS = (".config/pse-sun",)
 
 CAPABILITIES = "cap_sys_admin,cap_sys_nice+p"
 UNIT = "eclipse-sunshine.service"
@@ -250,6 +265,15 @@ def read_manifest(path: str = MANIFEST) -> dict[str, Any]:
         return {}
 
 
+def installed_manifest() -> dict[str, Any]:
+    """Manifest of the installation, a legacy one included (a repair keeps its version)."""
+    for root in (ROOT, *LEGACY_ROOTS):
+        manifest = read_manifest(os.path.join(root, "eclipse.json"))
+        if manifest:
+            return manifest
+    return {}
+
+
 def state(helpers_dir: Optional[str] = None, root: str = ROOT) -> dict[str, Any]:
     """What is installed in ``root``.
 
@@ -260,7 +284,13 @@ def state(helpers_dir: Optional[str] = None, root: str = ROOT) -> dict[str, Any]
     launcher = os.path.join(root, "bin", "eclipse-sunshine")
     installed = os.path.isfile(launcher) and os.path.isfile(os.path.join(root, "bin", "sunshine"))
     if not installed:
-        return {"installed": False, "version": None, "captureReady": False, "helpersOutdated": False}
+        if root == ROOT:
+            for legacy in LEGACY_ROOTS:
+                found = state(None, legacy)
+                if found["installed"]:
+                    # Still runs, but must be reinstalled: see the module docstring.
+                    return {**found, "helpersOutdated": True, "legacy": True}
+        return {"installed": False, "version": None, "captureReady": False, "helpersOutdated": False, "legacy": False}
     outdated = False
     if helpers_dir:
         installed_paths = {"eclipse-sunshine": launcher, "libeclipse-sunshine.so": os.path.join(root, "lib", "libeclipse-sunshine.so")}
@@ -273,6 +303,7 @@ def state(helpers_dir: Optional[str] = None, root: str = ROOT) -> dict[str, Any]
         "version": read_manifest(os.path.join(root, "eclipse.json")).get("version"),
         "captureReady": has_capabilities(launcher),
         "helpersOutdated": outdated,
+        "legacy": False,
     }
 
 

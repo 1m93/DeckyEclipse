@@ -20,6 +20,7 @@ import json
 import os
 import shutil
 import ssl
+import stat
 import subprocess
 import sys
 import tempfile
@@ -109,6 +110,34 @@ def fetch(url: str, label: str = "", span: tuple[int, int] = (0, 0), attempts: i
     raise Failure(f"Could not download {url}: {last_error}")
 
 
+def root_owned_dir(path: str) -> bool:
+    """A real directory (no symlink) owned by root and writable by root only."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISDIR(st.st_mode) and st.st_uid == 0 and not st.st_mode & 0o022
+
+
+def prepare_base() -> None:
+    """Create BASE, the root-owned parent of ROOT: whoever can write it could swap ROOT."""
+    if not os.path.lexists(sn.BASE):
+        os.mkdir(sn.BASE, 0o755)
+        os.chmod(sn.BASE, 0o755)
+    if not root_owned_dir(sn.BASE):
+        raise Failure(f"{sn.BASE} exists but is not a directory owned by root; remove it and try again")
+
+
+def remove_installation(path: str) -> None:
+    """Remove an installation directory of ours; anything else at that path is left alone."""
+    if not os.path.lexists(path):
+        return
+    if not root_owned_dir(path):
+        say(f"Leaving {path} alone: it is not a directory owned by root")
+        return
+    shutil.rmtree(path)
+
+
 def run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
     res = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=False)
     if check and res.returncode != 0:
@@ -144,8 +173,9 @@ def install(tag: str | None) -> None:
         libs.append(data)
 
     step(77, "Unpacking...")
+    prepare_base()
     # Same file system as ROOT, so the final step is an atomic rename.
-    stage = tempfile.mkdtemp(prefix=".eclipse-sun.", dir=os.path.dirname(sn.ROOT))
+    stage = tempfile.mkdtemp(prefix=".sunshine.", dir=sn.BASE)
     try:
         system_files: dict[str, bytes] = {}
         with sn.deb_data(deb) as tar:
@@ -207,6 +237,9 @@ def install(tag: str | None) -> None:
             os.rename(sn.ROOT, old)
         os.rename(stage, sn.ROOT)
         shutil.rmtree(old, ignore_errors=True)
+        # Earlier versions installed elsewhere (see sunshine_native.LEGACY_ROOTS).
+        for legacy in sn.LEGACY_ROOTS:
+            remove_installation(legacy)
     except BaseException:
         shutil.rmtree(stage, ignore_errors=True)
         raise
@@ -228,8 +261,12 @@ def install(tag: str | None) -> None:
 
 def uninstall() -> None:
     # The udev rules stay: the Flatpak build of Sunshine installs the same file.
-    if os.path.lexists(sn.ROOT):
-        shutil.rmtree(sn.ROOT)
+    for path in (sn.ROOT, *sn.LEGACY_ROOTS):
+        remove_installation(path)
+    try:
+        os.rmdir(sn.BASE)
+    except OSError:
+        pass  # Missing, or not empty.
     say("Removed Sunshine for Gaming Mode")
 
 

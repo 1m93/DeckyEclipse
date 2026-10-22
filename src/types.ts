@@ -114,6 +114,9 @@ export interface LibraryEntry {
   steamAppId: number;
 }
 
+/** "afterStream": a minute after the last device left; numbers: idle minutes. */
+export type SunshineAutoOff = "never" | "afterStream" | "15" | "30" | "60";
+
 export type MoonlightSource = "auto" | "flatpak" | "native" | "custom";
 
 export type Feature = "moonlight" | "sunshine";
@@ -133,12 +136,18 @@ export interface Settings {
     port: number;
     deviceName: string;
     autostart: boolean;
+    /** Toast when another device starts or stops streaming from this one. */
+    notifySessions: boolean;
+    /** Turn Sunshine off when nobody streams. */
+    autoOff: SunshineAutoOff;
   };
   behavior: {
     autoWake: boolean;
     wakeTimeoutS: number;
     showOffline: boolean;
     pollIntervalS: number;
+    /** Ask before End stream also closes the game on the host. */
+    confirmEndStream: boolean;
   };
   updates: {
     autoCheck: boolean;
@@ -300,6 +309,8 @@ export interface NativeSunshineState {
   captureReady: boolean;
   /** The plugin ships newer helpers than the installed ones: a repair installs them. */
   helpersOutdated: boolean;
+  /** Installed by an earlier Eclipse version in the old place: a repair moves it (fixes pairing). */
+  legacy?: boolean;
 }
 
 export interface SunshineStatus {
@@ -350,4 +361,42 @@ export interface PairOutcome extends Result {
   client?: string;
   /** Several devices are waiting: pick one and retry with its id. */
   choose?: PendingPairing[];
+}
+
+/**
+ * Streams from the Sunshine on this device (see sunshine_session.py). Sunshine
+ * does not say which device is streaming, only how many.
+ */
+export interface SunshineSession {
+  /** Sunshine answers on this device. */
+  reachable: boolean;
+  /** An app is open; it stays open after a device leaves without quitting it. */
+  appOpen: boolean;
+  appName: string | null;
+  /** Devices streaming right now. */
+  clients: number;
+  /** When the current session started (epoch ms). */
+  since: number | null;
+}
+
+/** What the Quick Access menu shows about sharing this device. */
+export interface SunshineOverview {
+  address: string | null;
+  /** Paired devices, or null without a working Sunshine login. */
+  paired: number | null;
+}
+
+export interface EndSessionResult extends Result {
+  /** "closed": the open app was closed · "restarted": Sunshine was restarted. */
+  method: "closed" | "restarted";
+  /** The app could not be closed (no login, or Sunshine refused): only a restart ends the stream. */
+  needsRestart?: boolean;
+}
+
+/** A PC answering on the local network (see `discover_hosts`). */
+export interface DiscoveredHost {
+  address: string;
+  name: string;
+  /** Already added (paired in Moonlight). */
+  known: boolean;
 }

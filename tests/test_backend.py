@@ -20,6 +20,9 @@ from eclipse.presets import AUTO_PRESET, STREAM_DEFAULTS, all_presets, effective
 from eclipse.settings import SettingsStore, deep_merge, mask_secrets, strip_masked_fields  # noqa: E402
 from eclipse import sunshine  # noqa: E402
 from eclipse import sunshine_native  # noqa: E402
+from eclipse import sunshine_session  # noqa: E402
+from eclipse import account  # noqa: E402
+from eclipse import sunshine_data  # noqa: E402
 
 SAMPLE_CONF = r"""
 [General]
@@ -792,7 +795,15 @@ class NativeSunshineTests(unittest.TestCase):
         data = b"\0/usr/share/sunshine\0/usr/share/sunshine/web\0"
         patched, places = sunshine_native.patch_assets_prefix(data)
         self.assertEqual((places, len(patched)), (2, len(data)))
-        self.assertIn(b"/home/.eclipse-sun//web", patched)
+        self.assertIn(b"/home/.ecl/sunshine/web", patched)
+
+    def test_literals_sharing_the_end_of_the_prefix_survive(self):
+        # The linker stores "sunshine" (the config directory name) in the last bytes of
+        # "/usr/share/sunshine": patching must leave those bytes as they were.
+        data = b"\0/usr/share/sunshine\0"
+        literal_at = data.index(b"sunshine\0", 2)
+        patched, _ = sunshine_native.patch_assets_prefix(data)
+        self.assertEqual(patched[literal_at:literal_at + 9], b"sunshine\0")
 
     def test_picks_the_ubuntu_package_of_both_naming_schemes(self):
         for name in ("sunshine-ubuntu-22.04-amd64.deb", "sunshine_2026.914.233613-1+ubuntu22.04_amd64.deb"):
@@ -839,6 +850,20 @@ class NativeSunshineTests(unittest.TestCase):
             self.assertFalse(state["captureReady"], "no file capability in a temp dir")
             self.assertFalse(sunshine_native.state(helpers, os.path.join(tmp, "missing"))["installed"])
 
+    def test_legacy_installation_needs_a_repair(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            legacy = os.path.join(tmp, "legacy")
+            for name in ("bin/sunshine", "bin/eclipse-sunshine"):
+                os.makedirs(os.path.dirname(os.path.join(legacy, name)), exist_ok=True)
+                open(os.path.join(legacy, name), "wb").close()
+            original = (sunshine_native.ROOT, sunshine_native.LEGACY_ROOTS)
+            sunshine_native.ROOT, sunshine_native.LEGACY_ROOTS = os.path.join(tmp, "new"), (legacy,)
+            try:
+                state = sunshine_native.state(None, sunshine_native.ROOT)
+            finally:
+                sunshine_native.ROOT, sunshine_native.LEGACY_ROOTS = original
+            self.assertEqual((state["installed"], state["legacy"], state["helpersOutdated"]), (True, True, True))
+
 
 class SudoTests(unittest.TestCase):
     def run_root(self, lines, rc):
@@ -878,6 +903,294 @@ class SudoTests(unittest.TestCase):
         local = sunshine.LocalSunshine("/nonexistent", "/tmp", "/plugin")
         result = asyncio.run(local._run_root(["uninstall"], "", lambda _: None))
         self.assertFalse(result["ok"])
+
+
+def sunshine_line(message, stamp="2026-10-22 10:00:00"):
+    return f"[{stamp}.123]: Info: {message}\n"
+
+
+class SunshineSessionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.log = os.path.join(self.tmp.name, "sunshine.log")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write(self, text, mode="a"):
+        with open(self.log, mode, encoding="utf-8") as fh:
+            fh.write(text)
+
+    def test_counts_connects_and_disconnects(self):
+        state = sunshine_session.apply_log(
+            sunshine_session.LogState(),
+            sunshine_line("Sunshine version: v2026.1018.5342")
+            + sunshine_line("CLIENT CONNECTED", "2026-10-22 10:00:05")
+            + sunshine_line("CLIENT CONNECTED", "2026-10-22 10:01:00")
+            + sunshine_line("CLIENT DISCONNECTED"),
+        )
+        self.assertEqual(state.clients, 1)
+
+    def test_process_terminated_and_startup_reset(self):
+        text = sunshine_line("CLIENT CONNECTED") + sunshine_line("Process terminated")
+        self.assertEqual(sunshine_session.apply_log(sunshine_session.LogState(), text).clients, 0)
+        text = sunshine_line("CLIENT CONNECTED") + sunshine_line("Sunshine version: v1")
+        self.assertEqual(sunshine_session.apply_log(sunshine_session.LogState(), text).clients, 0)
+
+    def test_ping_timeout_ends_a_client(self):
+        text = sunshine_line("CLIENT CONNECTED") + sunshine_line("192.168.2.10: Ping Timeout")
+        self.assertEqual(sunshine_session.apply_log(sunshine_session.LogState(), text).clients, 0)
+
+    def test_follower_reads_incrementally_and_notices_a_rewrite(self):
+        follower = sunshine_session.LogFollower()
+        self.write(sunshine_line("Sunshine version: v1", "2026-10-22 09:00:00") + sunshine_line("CLIENT CONNECTED"), "w")
+        self.assertEqual(follower.read(self.log).clients, 1)
+        # An unfinished line is kept until it is complete.
+        self.write("[2026-10-22 10:05:00.000]: Info: CLIENT DISC")
+        self.assertEqual(follower.read(self.log).clients, 1)
+        self.write("ONNECTED\n")
+        self.assertEqual(follower.read(self.log).clients, 0)
+        self.write(sunshine_line("CLIENT CONNECTED"))
+        self.assertEqual(follower.read(self.log).clients, 1)
+        # Sunshine restarted and rewrote its log, longer than before.
+        self.write(sunshine_line("Sunshine version: v1", "2026-10-22 11:00:00") + sunshine_line("x" * 400), "w")
+        self.assertEqual(follower.read(self.log).clients, 0)
+        self.assertEqual(follower.read(None).clients, 0)
+
+    def test_app_ids_match_sunshine(self):
+        # Sunshine casts the CRC32 to int32 and takes abs().
+        import zlib
+
+        value = zlib.crc32(b"Desktop")
+        signed = value - (1 << 32) if value >= 1 << 31 else value
+        self.assertEqual(sunshine_session._app_ids("Desktop", None, 0)[0], str(abs(signed)))
+
+    def test_summary(self):
+        log_state = sunshine_session.LogState(clients=2, since=1000.0)
+        self.assertEqual(sunshine_session.summarize(None, log_state, None)["clients"], 0)
+        idle = sunshine_session.summarize({"currentGame": None}, log_state, None)
+        self.assertEqual((idle["appOpen"], idle["clients"]), (False, 0))
+        busy = sunshine_session.summarize({"currentGame": "123"}, log_state, "Desktop")
+        self.assertEqual((busy["appOpen"], busy["clients"], busy["since"], busy["appName"]), (True, 2, 1000000, "Desktop"))
+
+    def test_clients_without_open_app_are_dropped(self):
+        tracker = sunshine_session.SessionTracker()
+        # Closed through the API: no "CLIENT DISCONNECTED" line was logged.
+        self.write(sunshine_line("Sunshine version: v1") + sunshine_line("CLIENT CONNECTED"), "w")
+        self.assertEqual(tracker.update({"currentGame": "5"}, self.log)["clients"], 1)
+        self.assertEqual(tracker.update({"currentGame": None}, self.log)["clients"], 0)
+        self.write(sunshine_line("CLIENT CONNECTED"))
+        self.assertEqual(tracker.update({"currentGame": "5"}, self.log)["clients"], 1)
+
+    def test_app_name_from_apps_json(self):
+        name_id = sunshine_session._app_ids("Steam Big Picture", None, 1)[0]
+        with open(os.path.join(self.tmp.name, "apps.json"), "w", encoding="utf-8") as fh:
+            json.dump({"apps": [{"name": "Desktop", "image-path": "missing.png"}, {"name": "Steam Big Picture"}]}, fh)
+        self.assertEqual(sunshine_session.app_name(name_id, self.tmp.name), "Steam Big Picture")
+        self.assertIsNone(sunshine_session.app_name("1", self.tmp.name))
+
+
+FAKE_PASSWD_NONE = """#!/bin/bash
+stty -echo
+printf "New password: "; read a; echo
+if [ ${#a} -lt 4 ]; then echo "BAD PASSWORD: The password is shorter than 4 characters"; printf "New password: "; read a; exit 1; fi
+printf "Retype new password: "; read b; echo
+[ "$a" = "$b" ] || { echo "Sorry, passwords do not match."; exit 10; }
+echo "$a" > "$(dirname "$0")/result"
+echo "passwd: password updated successfully"
+"""
+
+FAKE_PASSWD_SET = """#!/bin/bash
+echo "Changing password for newton."
+sleep 0.2
+stty -echo; printf "Current password: "; read a; exit 1
+"""
+
+
+class AccountTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.env = dict(os.environ)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def script(self, name, text):
+        path = os.path.join(self.tmp.name, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.chmod(path, 0o755)
+        return [path]
+
+    def test_password_state(self):
+        self.assertEqual(account.password_state(self.script("none", FAKE_PASSWD_NONE), self.env), "none")
+        self.assertEqual(account.password_state(self.script("set", FAKE_PASSWD_SET), self.env), "set")
+        self.assertEqual(account.password_state(["/nonexistent/passwd"], self.env), "unknown")
+        self.assertFalse(os.path.exists(os.path.join(self.tmp.name, "result")), "checking changes nothing")
+
+    def test_set_first_password(self):
+        cmd = self.script("none", FAKE_PASSWD_NONE)
+        self.assertIn("shorter", account.set_first_password("abc", cmd, self.env))
+        self.assertIsNone(account.set_first_password("hunter22", cmd, self.env))
+        with open(os.path.join(self.tmp.name, "result"), encoding="utf-8") as fh:
+            self.assertEqual(fh.read().strip(), "hunter22")
+
+    def test_existing_password_is_not_replaced(self):
+        error = account.set_first_password("hunter22", self.script("set", FAKE_PASSWD_SET), self.env)
+        self.assertIn("already has a password", error)
+
+
+class DiscoveryTests(unittest.TestCase):
+    def test_scan_targets(self):
+        targets = network.scan_targets([{"interface": "wlan0", "address": "192.168.2.47", "prefix": "16"}])
+        self.assertEqual(len(targets), 253)
+        self.assertNotIn("192.168.2.47", targets)
+        self.assertIn("192.168.2.1", targets)
+        self.assertEqual(network.scan_targets([{"interface": "wlan0", "address": "8.8.8.8", "prefix": "24"}]), [])
+        self.assertEqual(len(network.scan_targets([{"interface": "wlan0", "address": "10.0.0.5", "prefix": "30"}])), 1)
+
+    def test_discover_lists_each_host_once(self):
+        original = network.probe
+
+        async def fake_probe(address, port, timeout=1.5):
+            if address in ("192.168.2.10", "192.168.2.11"):
+                return {"address": address, "hostname": "PC", "uniqueId": "pc-1"}
+            if address == "192.168.2.20":
+                return {"address": address, "hostname": "Another", "uniqueId": "pc-2"}
+            return None
+
+        network.probe = fake_probe
+        try:
+            found = asyncio.run(network.discover([{"interface": "wlan0", "address": "192.168.2.47", "prefix": "24"}]))
+        finally:
+            network.probe = original
+        self.assertEqual([f["hostname"] for f in found], ["Another", "PC"])
+
+
+class HostChecksTests(unittest.TestCase):
+    HOST = {"uuid": "u", "name": "PC", "addresses": [{"address": "192.168.2.10", "port": 47989}], "paired": True}
+    LOCAL = [{"interface": "wlan0", "address": "192.168.2.47", "prefix": "24"}]
+
+    def by_id(self, checks):
+        return {c["id"]: c for c in checks}
+
+    def test_offline_host(self):
+        checks = self.by_id(diagnostics.host_checks(self.HOST, None, True, self.LOCAL, None, None))
+        self.assertFalse(checks["reachable"]["ok"])
+        self.assertIn("192.168.2.10", checks["reachable"]["detail"])
+        self.assertIsNone(checks["wake"]["ok"])
+        self.assertNotIn("sunshine", checks)
+
+    def test_online_host_with_login(self):
+        info = {"address": "192.168.2.10", "latencyMs": 4, "version": "2026.1018", "busy": True}
+        checks = self.by_id(diagnostics.host_checks(
+            self.HOST, info, True, self.LOCAL, "aa:bb:cc:dd:ee:ff", {"ok": False, "error": None},
+        ))
+        self.assertTrue(checks["reachable"]["ok"])
+        self.assertTrue(checks["wake"]["ok"])
+        self.assertFalse(checks["login"]["ok"])
+        self.assertIn("busy", checks)
+
+
+class AutoOffTests(unittest.TestCase):
+    UP = {"reachable": True, "clients": 0}
+    STREAMING = {"reachable": True, "clients": 1}
+    DOWN = {"reachable": False, "clients": 0}
+
+    def test_never(self):
+        auto = sunshine_session.AutoOff()
+        self.assertIsNone(auto.update(self.UP, "never", 0))
+        self.assertIsNone(auto.update(self.UP, "never", 10_000))
+
+    def test_after_stream_needs_a_stream_and_a_minute(self):
+        auto = sunshine_session.AutoOff()
+        self.assertIsNone(auto.update(self.UP, "afterStream", 0))
+        self.assertIsNone(auto.update(self.UP, "afterStream", 600), "nobody streamed yet")
+        auto.update(self.STREAMING, "afterStream", 700)
+        self.assertIsNone(auto.update(self.UP, "afterStream", 710))
+        self.assertIsNone(auto.update(self.UP, "afterStream", 760))
+        self.assertEqual(auto.update(self.UP, "afterStream", 771), "the stream ended")
+
+    def test_changing_the_option_counts_from_then(self):
+        auto = sunshine_session.AutoOff()
+        auto.update(self.UP, "never", 0)
+        self.assertIsNone(auto.update(self.UP, "15", 1300))
+        self.assertEqual(auto.update(self.UP, "15", 1300 + 15 * 60), "nobody streamed for 15 minutes")
+
+    def test_after_stream_waits_longer_while_the_app_is_open(self):
+        auto = sunshine_session.AutoOff()
+        auto.update(self.STREAMING, "afterStream", 0)
+        lingering = {"reachable": True, "clients": 0, "appOpen": True}
+        auto.update(lingering, "afterStream", 10)
+        self.assertIsNone(auto.update(lingering, "afterStream", 200))
+        self.assertEqual(auto.update(lingering, "afterStream", 311), "the stream ended")
+
+    def test_idle_minutes_restart_with_a_stream_and_with_sunshine(self):
+        auto = sunshine_session.AutoOff()
+        auto.update(self.UP, "15", 0)
+        auto.update(self.STREAMING, "15", 800)
+        self.assertIsNone(auto.update(self.UP, "15", 900))
+        self.assertEqual(auto.update(self.UP, "15", 900 + 15 * 60), "nobody streamed for 15 minutes")
+        auto.update(self.DOWN, "15", 5000)
+        self.assertIsNone(auto.update(self.UP, "15", 5001))
+
+
+def state_json(*devices):
+    return {"root": {"uniqueid": "host-id", "named_devices": [
+        {"name": name, "cert": cert, "uuid": uuid, "enabled": "true"} for name, cert, uuid in devices
+    ]}, "username": "deck", "password": "hash", "salt": "salt"}
+
+
+class SunshineDataTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = self.tmp.name
+        self.new = os.path.join(self.home, ".config", "sunshine")
+        self.legacy = os.path.join(self.home, ".config", "pse-sun")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write(self, path, text):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+
+    def test_duplicates_keep_the_newest_record(self):
+        state = state_json(("Phone", "CERT-A", "u1"), ("TV", "CERT-B", "u2"), ("Phone", "CERT-A\n", "u3"))
+        self.assertEqual(sunshine_data.duplicate_clients(state), ["u1"])
+        self.assertEqual(sunshine_data.duplicate_clients({}), [])
+
+    def test_dedupe_state_file(self):
+        path = os.path.join(self.new, "sunshine_state.json")
+        self.write(path, json.dumps(state_json(("Phone", "A", "u1"), ("Phone", "A", "u2"), ("Phone", "A", "u3"))))
+        self.assertEqual(sunshine_data.dedupe_state_file(path), 2)
+        data = json.load(open(path))
+        self.assertEqual([d["uuid"] for d in data["root"]["named_devices"]], ["u3"])
+        self.assertEqual(data["username"], "deck", "the login is kept")
+        self.assertEqual(sunshine_data.dedupe_state_file(path), 0)
+
+    def test_migrate_moves_legacy_data_back(self):
+        self.write(os.path.join(self.new, "sunshine.conf"), "system_tray = disabled\n")
+        self.write(os.path.join(self.legacy, "sunshine.conf"), "encoder = vaapi\n")
+        self.write(os.path.join(self.legacy, "credentials", "cacert.pem"), "server cert")
+        self.write(os.path.join(self.legacy, "sunshine_state.json"),
+                   json.dumps(state_json(("Phone", "A", "u1"), ("Phone", "A", "u2"))))
+        done = sunshine_data.migrate(self.home)
+        self.assertFalse(os.path.exists(self.legacy))
+        self.assertEqual(open(os.path.join(self.new, "sunshine.conf")).read(), "encoder = vaapi\n")
+        self.assertEqual(open(os.path.join(self.new, "credentials", "cacert.pem")).read(), "server cert")
+        devices = json.load(open(os.path.join(self.new, "sunshine_state.json")))["root"]["named_devices"]
+        self.assertEqual([d["uuid"] for d in devices], ["u2"])
+        self.assertTrue(os.path.exists(os.path.join(self.new, "moved-by-eclipse", "sunshine", "sunshine.conf")))
+        self.assertEqual(len(done), 2)
+        self.assertEqual(sunshine_data.migrate(self.home), [], "nothing left to do")
+
+    def test_remove_all(self):
+        self.write(os.path.join(self.new, "a"), "x")
+        self.write(os.path.join(self.legacy, "b"), "y")
+        sunshine_data.remove_all(self.home)
+        self.assertFalse(os.path.exists(self.new) or os.path.exists(self.legacy))
 
 
 if __name__ == "__main__":

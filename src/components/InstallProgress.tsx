@@ -35,7 +35,7 @@ export function InstallProgress() {
       <ButtonItem layout="below" disabled={cancelling} onClick={() => void cancelInstall()}>
         {cancelling ? "Cancelling..." : "Cancel"}
       </ButtonItem>
-      <ButtonItem layout="below" onClick={() => openEclipsePage("about")}>
+      <ButtonItem layout="below" onClick={() => openEclipsePage("help", null, "plugin")}>
         View log
       </ButtonItem>
     </div>

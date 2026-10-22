@@ -28,7 +28,16 @@ function confirmUnpair(client: PairedClient, onDone: () => void) {
  * Devices paired with this device's Sunshine, plus devices waiting for a PIN
  * (shown live on newer Sunshine versions).
  */
-export function SunshineDevicesSection({ running, hasLogin }: { running: boolean; hasLogin: boolean }) {
+export function SunshineDevicesSection({
+  running,
+  hasLogin,
+  onChanged,
+}: {
+  running: boolean;
+  hasLogin: boolean;
+  /** Paired devices changed (paired or unpaired). */
+  onChanged?: () => void;
+}) {
   const [clients, setClients] = useState<PairedClient[] | null>(null);
   const [clientsError, setClientsError] = useState<string | null>(null);
   const [pending, setPending] = useState<PendingPairing[]>([]);
@@ -65,20 +74,21 @@ export function SunshineDevicesSection({ running, hasLogin }: { running: boolean
   const afterPairing = () => {
     void loadClients();
     setPending([]);
+    onChanged?.();
   };
 
   if (!hasLogin) {
     return (
       <DialogControlsSection>
-        <DialogControlsSectionHeader>Paired devices</DialogControlsSectionHeader>
-        <Field label="Sunshine login needed" description="Save the Sunshine login below to see and pair devices." />
+        <DialogControlsSectionHeader>Devices</DialogControlsSectionHeader>
+        <Field label="Sunshine login needed" description="Save the Sunshine login above to see and pair devices." />
       </DialogControlsSection>
     );
   }
 
   return (
     <DialogControlsSection>
-      <DialogControlsSectionHeader>Paired devices</DialogControlsSectionHeader>
+      <DialogControlsSectionHeader>Devices</DialogControlsSectionHeader>
       {!running && <Field label="Sunshine is stopped" description="Start Sunshine to pair devices and see the list." />}
 
       {pending.map((request) => (
@@ -115,7 +125,12 @@ export function SunshineDevicesSection({ running, hasLogin }: { running: boolean
               key={client.uuid}
               label={client.name}
               description={client.enabled === false ? "Disabled in Sunshine" : undefined}
-              onClick={() => confirmUnpair(client, () => void loadClients())}
+              onClick={() =>
+                confirmUnpair(client, () => {
+                  void loadClients();
+                  onChanged?.();
+                })
+              }
             >
               Unpair
             </ButtonItem>

@@ -10,12 +10,23 @@ Both halves are optional. When you first open the plugin, it asks what you use: 
 (Moonlight), **share this device's games** (Sunshine), or both. Only the parts you pick are shown, and nothing is
 installed until you press *Install*. You can change this later in *Settings → General*.
 
+The Quick Access menu treats both halves the same:
+
+- At the top, whatever is happening right now: the stream you are playing, devices streaming from this one,
+  and devices asking to pair. Each comes with its action (*End stream*, *Enter PIN*).
+- Below it, two tabs: **Play** (hosts and stream quality) and **Share** (the Sunshine server, this device's
+  address, pairing). The menu remembers the last tab and opens on the side where something is happening.
+- The full-screen settings follow the same order: *Hosts* and *Stream quality*, then *Sharing*, then
+  *General*, *Troubleshooting* (connection checks and logs) and *About*.
+
 **Streaming (Moonlight client)**
 
 - Lists paired hosts from Moonlight's own config and shows them as online, busy or offline, with latency.
 - Pick an app and stream with one button. The last-played app gets focus first, so **A, A** resumes it.
 - Wake-on-LAN: the MAC address is read from Moonlight or Sunshine, or you can enter it yourself. Offline hosts
   are woken automatically before a stream starts.
+- *Add host* lists the PCs running Sunshine on your network (it asks each address of this device's /24 network
+  for `/serverinfo`), so you do not need to know the PC's IP address. You can still type one.
 - Pairing from Gaming Mode: Eclipse makes the PIN and shows it in a large dialog and a notification. If you save
   the host's Sunshine web UI credentials, Eclipse enters the PIN on the host for you.
 - The default quality preset is **Auto: match display**. It picks resolution, frame rate and bitrate for the
@@ -49,8 +60,13 @@ installed until you press *Install*. You can change this later in *Settings → 
     config.
 - "Add to Steam library" makes a separate non-Steam shortcut for a host/app pair, using Moonlight's cached box
   art. The shortcut wakes the host if needed and starts streaming.
-- A "Now streaming" panel with *End stream* and *Quit app on host*.
-- **Ending a stream also ends the session on the host by default** (*End the host session too* in Streaming
+- A *Playing* card at the top of the Quick Access menu with *End stream*, plus *Quit app on host* when ending
+  the stream leaves the app open. When *End stream* also closes the game on the host, Eclipse asks first
+  (*General → Ask before closing the game on the host*).
+- *Troubleshooting → Play* checks the connection to a host step by step (network, the PC answers, Sunshine
+  runs, paired, Wake-on-LAN, its Sunshine login) and offers the fix (*Wake*, *Pair again*). Stream failure
+  notifications open it.
+- **Ending a stream also ends the session on the host by default** (*End the host session too* in *Stream quality*
   settings). Moonlight gets `--quit-after`. Steam's End stream and Exit game kill Moonlight, which can leave the
   app open on the host, so Eclipse checks the host a few seconds after the stream ends. If an app is still
   open, Eclipse closes it through the Sunshine API when credentials are saved, or with `moonlight quit`
@@ -63,29 +79,46 @@ installed until you press *Install*. You can change this later in *Settings → 
 
 - Install **Sunshine for Gaming Mode** when you need it (see below). Installing, updating, repairing and
   removing it ask for your SteamOS (sudo) password; Eclipse passes it to sudo for that step and never saves it.
-- Sunshine only runs when you start it from the Quick Access menu or the Sunshine page. **Start automatically**
+  A fresh SteamOS has no password: Eclipse notices (from `passwd`'s prompts) and lets you choose one right
+  there, so there is no trip to Desktop Mode.
+- *Set up automatically* creates Sunshine's web UI login with a generated password and shows it once. Eclipse
+  uses it to pair devices and end streams. *Show password* in *Sharing* shows it again, for the web page.
+- **Turn off automatically** (off by default) saves battery: Sunshine turns itself off a minute after the
+  stream ends, or after 15/30/60 minutes without a stream.
+- Sunshine only runs when you start it from the Quick Access menu or the *Sharing* page. **Start automatically**
   is a separate option and is off by default. With it on, Eclipse starts Sunshine when the plugin loads and
   enables the systemd user service. With it off, Eclipse disables the service, so Sunshine never starts by
   itself.
 - A Sunshine Flatpak is still detected and controlled, but it cannot stream Gaming Mode. Eclipse offers to
   install Sunshine for Gaming Mode instead and to remove the Flatpak.
 - Pair Moonlight clients with your Deck and see the real result (paired, wrong PIN, timed out).
-  - Newer Sunshine versions list the devices waiting to pair, and they show up live on the Sunshine page.
+  - Newer Sunshine versions list the devices waiting to pair. They show up live at the top of the Quick Access
+    menu and on the *Sharing* page.
   - Older versions take the PIN only. Eclipse then confirms pairing by watching for the new device in the
     paired list.
 - See the paired devices and unpair them.
+- See when other devices stream from this one: the Quick Access menu shows how many are connected, which app
+  and for how long, with *End stream*. A notification tells you when a device starts or stops streaming (*General
+  → Notifications*, on by default). Sunshine has no API for its sessions, so Eclipse combines `/serverinfo` (the
+  open app) with Sunshine's log (clients connecting and leaving); Sunshine does not log which device it is.
+  *End stream* closes the open app through the Sunshine API with the saved login, or restarts Sunshine (after
+  asking) without one.
 - When the Deck pairs with a PC, Eclipse reports the outcome after Moonlight's pairing window closes.
 
 ### Sunshine for Gaming Mode
 
 The Flatpak and AppImage builds of Sunshine cannot capture Gaming Mode: their KMS capture is compiled out.
-Eclipse installs Sunshine's official Ubuntu 22.04 build instead, into `/home/.eclipse-sun`:
+Eclipse installs Sunshine's official Ubuntu 22.04 build instead, into `/home/.ecl/sunshine`:
 
 - The installer (`bin/eclipse_sunshine_root.py`) runs as root through sudo. It downloads the release from
   GitHub and the two libraries SteamOS lacks from Ubuntu (checked by SHA-256), and builds the installation in a
   fresh root-owned directory. `/home` survives SteamOS updates.
 - Sunshine reads its web UI from the compiled-in `/usr/share/sunshine`, which is read-only on SteamOS. The
-  installer rewrites that path in the binary to `/home/.eclipse-sun/` (same length).
+  installer rewrites that path in the binary to `/home/.ecl/sunshine`. It has the same length and the same
+  ending: the compiler stores the literal `"sunshine"` (the name of the config directory) in the last bytes of
+  `"/usr/share/sunshine"`, so those bytes must stay. Eclipse versions that used `/home/.eclipse-sun/` made
+  Sunshine keep its data in `~/.config/pse-sun`; *Repair* moves the installation and that data back, with the
+  login, paired devices and server certificate.
 - `bin/eclipse-sunshine` (`native/sunshine_launcher.c`) has the `cap_sys_admin,cap_sys_nice` file
   capabilities and starts Sunshine with them as ambient capabilities. Sunshine drops them right after startup
   except in its DRM worker thread. The launcher only passes them on while the installation is owned by root.
@@ -97,9 +130,12 @@ Eclipse installs Sunshine's official Ubuntu 22.04 build instead, into `/home/.ec
   - When Sunshine restarts itself, it re-executes its own binary. The library sends that through the launcher,
     so Sunshine keeps its capabilities and libraries.
 - The installer also adds Sunshine's udev rules and loads `uhid` for virtual controllers.
+- Sunshine 2026.914 adds a second record when a device pairs again and then rejects that device (Moonlight:
+  "Certificate verification failed", Error 401). Eclipse removes the older records: from the state file before
+  Sunshine starts, and through the API (with the saved login) as soon as the file changes.
 - Sunshine runs as the systemd user service `eclipse-sunshine.service`, with its config in
   `~/.config/sunshine`. Eclipse sets `system_tray = disabled` there, because Gaming Mode has no tray.
-- After an Eclipse update that changes these helpers, the Sunshine page offers **Repair**, which reinstalls
+- After an Eclipse update that changes these helpers, the *Sharing* page offers **Repair**, which reinstalls
   the same version.
 
 The helpers are cross-compiled with zig (installed from PyPI) by `pnpm native`. `pnpm package` does this
@@ -176,7 +212,7 @@ To install on a Deck, turn on Decky's developer mode, copy the zip over, and use
 can also copy `out/Eclipse` to `~/homebrew/plugins/` and restart Decky
 (`sudo systemctl restart plugin_loader`).
 
-Logs can be read on the device in *Settings → About → Logs*. The plugin log shows install output, Sunshine API
+Logs can be read on the device in *Settings → Troubleshooting → Logs*. The plugin log shows install output, Sunshine API
 errors and so on, and refreshes live while an install runs. The launcher log shows the exact Moonlight command
 lines. The files are:
 

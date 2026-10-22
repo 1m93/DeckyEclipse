@@ -29,16 +29,16 @@ export function FeatureSetup() {
       </PanelSectionRow>
       <PanelSectionRow>
         <ToggleField
-          label="Play games from a PC"
-          description="Moonlight client: stream from a computer running Sunshine."
+          label="Play: stream games from a PC"
+          description="Moonlight: play games running on a computer with Sunshine."
           checked={moonlight}
           onChange={setMoonlight}
         />
       </PanelSectionRow>
       <PanelSectionRow>
         <ToggleField
-          label="Share this device's games"
-          description="Sunshine host: let other devices stream from here. It only runs when you start it, unless you turn on autostart."
+          label="Share: let other devices stream from here"
+          description="Sunshine: other devices play this device's games. It only runs when you turn it on, unless you turn on autostart."
           checked={sunshine}
           onChange={setSunshine}
         />

@@ -13,10 +13,10 @@ import re
 from typing import Any, Optional
 
 from . import DEFAULT_HTTP_PORT, DEFAULT_SUNSHINE_WEB_PORT, FLATPAK_SUNSHINE
-from . import network, proc
+from . import network, proc, sunshine_native
 
 _IP_LINE_RE = re.compile(r"^\d+:\s+(\S+)\s+inet\s+([\d.]+)/(\d+)")
-_VIRTUAL_IFACES = ("docker", "br-", "virbr", "veth", "tailscale", "zt", "lo")
+VIRTUAL_IFACES = ("docker", "br-", "virbr", "veth", "tailscale", "zt", "lo")
 
 # Default Sunshine ports, for the firewall hint.
 PORTS_HINT = "TCP 47984, 47989, 47990, 48010 and UDP 47998-48000, 48002, 48010"
@@ -31,9 +31,9 @@ async def local_ipv4(home: Optional[str] = None) -> list[dict[str, str]]:
     for line in out.splitlines():
         match = _IP_LINE_RE.match(line.strip())
         if match:
-            iface, address, _ = match.groups()
-            found.append({"interface": iface, "address": address})
-    return sorted(found, key=lambda entry: entry["interface"].startswith(_VIRTUAL_IFACES))
+            iface, address, prefix = match.groups()
+            found.append({"interface": iface, "address": address, "prefix": prefix})
+    return sorted(found, key=lambda entry: entry["interface"].startswith(VIRTUAL_IFACES))
 
 
 async def _system_service(name: str, home: Optional[str]) -> Optional[bool]:
@@ -59,6 +59,8 @@ def sunshine_log_path(home: str) -> Optional[str]:
     candidates = [
         os.path.join(home, ".var", "app", FLATPAK_SUNSHINE, "config", "sunshine", "sunshine.log"),
         os.path.join(home, ".config", "sunshine", "sunshine.log"),
+        # Where Sunshine for Gaming Mode installed by earlier versions writes it, until repaired.
+        *(os.path.join(home, relative, "sunshine.log") for relative in sunshine_native.LEGACY_CONFIG_DIRS),
     ]
     existing = [path for path in candidates if os.path.isfile(path)]
     return max(existing, key=os.path.getmtime) if existing else None
@@ -175,3 +177,66 @@ async def run(status: dict[str, Any], home: str) -> dict[str, Any]:
         ),
     ]
     return {"checks": checks, "addresses": ips, "logPath": log_path}
+
+
+def host_checks(
+    host: dict[str, Any],
+    info: Optional[dict[str, Any]],
+    moonlight_ok: bool,
+    local: list[dict[str, str]],
+    mac: Optional[str],
+    login: Optional[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Why streaming from ``host`` fails, step by step. ``info``: its serverinfo, or None.
+
+    ``login``: result of testing the host's saved Sunshine login, or None without one.
+    """
+    checks = [
+        _check(
+            "moonlight", "Moonlight is installed", moonlight_ok,
+            hint="Install Moonlight in Settings → General → Apps.",
+        ),
+        _check(
+            "network", "This device is on a network", bool(local),
+            ", ".join(entry["address"] for entry in local),
+            "Connect to the same Wi-Fi or LAN as the PC.",
+        ),
+    ]
+    addresses = ", ".join(entry["address"] for entry in host.get("addresses") or []) or "no address known"
+    if info:
+        checks.append(_check(
+            "reachable", "The PC answers", True,
+            f"{info.get('address')} · {info.get('latencyMs', '?')} ms",
+        ))
+        version = info.get("version")
+        checks.append(_check("sunshine", "Sunshine runs on the PC", True, f"Version {version}" if version else ""))
+    else:
+        checks.append(_check(
+            "reachable", "The PC answers", False, f"Tried {addresses}",
+            "The PC is off or asleep (wake it), Sunshine is not running on it, it is on another network, "
+            f"or its firewall blocks {PORTS_HINT}.",
+        ))
+    checks.append(_check(
+        "paired", "This device is paired with the PC", bool(host.get("paired")),
+        hint="Pair again: Hosts → this host → Pair again.",
+    ))
+    checks.append(_check(
+        "wake", "The PC can be woken from here", True if mac else None, mac or "",
+        "No MAC address known yet. It is learned while the PC is online, or enter it under Hosts → Wake-on-LAN.",
+    ))
+    if login is None:
+        checks.append(_check(
+            "login", "The PC's Sunshine login", None,
+            hint="Optional. With it, Eclipse enters pairing PINs, switches the PC's monitor and closes games there.",
+        ))
+    else:
+        checks.append(_check(
+            "login", "The PC's Sunshine login works", bool(login.get("ok")),
+            hint=login.get("error") or "Sunshine rejected the saved login. Change it under Hosts → this host.",
+        ))
+    if info and info.get("busy"):
+        checks.append(_check(
+            "busy", "No other app is open on the PC", None,
+            hint="An app is open on the PC. Streaming it resumes it; another app can only start once it is closed.",
+        ))
+    return checks

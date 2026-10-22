@@ -1,5 +1,6 @@
 import { toaster } from "@decky/api";
-import { Navigation } from "@decky/ui";
+import { ConfirmModal, Navigation, ToggleField, showModal } from "@decky/ui";
+import { useState } from "react";
 import { backend } from "../backend";
 import type {
   AppOperation,
@@ -16,11 +17,13 @@ import {
   loadInitialState,
   refreshAfterStream,
   refreshHosts,
+  refreshIncoming,
   setState,
   updateSettings,
 } from "./store";
 import { chooseMonitor } from "../components/MonitorChoiceModal";
 import { askSudoPassword } from "../components/SudoPasswordModal";
+import { showLocalSunshineLogin } from "../components/SunshineLoginModal";
 import { hasSunshineLogin } from "./monitors";
 import { openEclipsePage } from "./navigation";
 import { ensureLauncherShortcut, markInternalLaunch, runApp, terminateApp } from "./steam";
@@ -31,6 +34,15 @@ const LAUNCH_CONFIRM_TIMEOUT_MS = 30000;
 
 export function notify(body: string, title = TITLE, duration?: number): void {
   toaster.toast({ title, body, duration });
+}
+
+/** A stream problem: pressing the toast opens the connection checks for that host. */
+function notifyStreamProblem(body: string, hostUuid: string): void {
+  toaster.toast({
+    title: TITLE,
+    body: `${/[.!?]$/.test(body) ? body : `${body}.`} Press for connection checks.`,
+    onClick: () => openEclipsePage("help", hostUuid),
+  });
 }
 
 function errorText(err: unknown): string {
@@ -88,7 +100,7 @@ export async function streamApp(
       res = await backend.prepareStream(host.uuid, appName);
     }
     if (!res.ok) {
-      notify(res.error ?? "Could not start the stream");
+      notifyStreamProblem(res.error ?? "Could not start the stream", host.uuid);
       return false;
     }
     const appId = await launchPending();
@@ -100,7 +112,7 @@ export async function streamApp(
       const current = getState().session;
       if (current && current.startedAt === startedAt && !current.confirmed) {
         setState({ session: null });
-        notify("Moonlight did not start. Check the launcher log in Eclipse settings.");
+        notifyStreamProblem("Moonlight did not start", host.uuid);
       }
     }, LAUNCH_CONFIRM_TIMEOUT_MS);
     // The backend already stored lastApp; mirror it locally without another write.
@@ -113,7 +125,7 @@ export async function streamApp(
     Navigation.CloseSideMenus();
     return true;
   } catch (err) {
-    notify(`Launch failed: ${errorText(err)}`);
+    notifyStreamProblem(`Launch failed: ${errorText(err)}`, host.uuid);
     return false;
   } finally {
     setState((prev) => ({ launching: null, launchStage: null, waking: omit(prev.waking, host.uuid) }));
@@ -164,6 +176,46 @@ export function handleStreamEnded(session: StreamSession): void {
   })();
 }
 
+function ConfirmEndStreamModal({
+  session,
+  onEnd,
+  closeModal,
+}: {
+  session: StreamSession;
+  onEnd: () => void;
+  closeModal?: () => void;
+}) {
+  const [dontAsk, setDontAsk] = useState(false);
+  return (
+    <ConfirmModal
+      strTitle={`Close ${session.appName} on ${session.hostName}?`}
+      strDescription="Ending the stream also closes the game on the host, so unsaved progress there may be lost. To keep games open after a stream, turn off End the host session too in Stream quality."
+      strOKButtonText="End stream and close"
+      closeModal={closeModal}
+      onOK={() => {
+        if (dontAsk) updateSettings({ behavior: { confirmEndStream: false } }, 0);
+        onEnd();
+      }}
+    >
+      <ToggleField label="Don't ask again" checked={dontAsk} onChange={setDontAsk} />
+    </ConfirmModal>
+  );
+}
+
+/**
+ * End the stream from the Quick Access menu. When that also closes the game
+ * on the host, ask first (unless the user turned the question off).
+ */
+export function requestEndStream(): void {
+  const { session, settings } = getState();
+  const closesHostApp = Boolean(session?.hostUuid) && !session?.pairAddress && (settings?.stream.quitAppAfter ?? true);
+  if (!session || !closesHostApp || settings?.behavior.confirmEndStream === false) {
+    void endStream();
+    return;
+  }
+  showModal(<ConfirmEndStreamModal session={session} onEnd={() => void endStream()} />);
+}
+
 export async function endStream(): Promise<void> {
   const { session } = getState();
   if (!session) {
@@ -182,9 +234,118 @@ export async function endStream(): Promise<void> {
   }, END_STREAM_FALLBACK_MS);
 }
 
+/** Re-check incoming streams a few times while Sunshine winds them down. */
+function refreshIncomingSoon(): void {
+  for (const delay of [1500, 4000, 8000]) window.setTimeout(() => void refreshIncoming(), delay);
+}
+
+/** Session toasts stay quiet briefly after the user ended the streams: they already got feedback. */
+const QUIET_AFTER_END_MS = 15000;
+let quietUntil = 0;
+
+export function incomingToastsMuted(): boolean {
+  return Date.now() < quietUntil;
+}
+
+function confirmRestart(reason: string, onOK: () => void): void {
+  showModal(
+    <ConfirmModal
+      strTitle="Restart Sunshine?"
+      strDescription={`${reason} Restarting Sunshine disconnects every device streaming from here; it is back a few seconds later.`}
+      strOKButtonText="Restart Sunshine"
+      onOK={onOK}
+    />,
+  );
+}
+
+/**
+ * End every stream from the Sunshine on this device, or close the app left
+ * open there. The open app is closed through Sunshine's API with the saved
+ * login. Sunshine is only restarted when that is impossible, and only after
+ * the user agreed.
+ */
+export async function endIncomingStream(): Promise<void> {
+  if (getState().endingIncoming) return;
+  const streaming = (getState().incoming?.clients ?? 0) > 0;
+  const done = streaming ? "The stream from this device ended" : "Closed the app on this device";
+  const run = async (restart: boolean): Promise<void> => {
+    setState({ endingIncoming: true });
+    quietUntil = Date.now() + QUIET_AFTER_END_MS;
+    try {
+      const res = await backend.sunshineEndSession(restart);
+      if (res.ok) {
+        notify(res.method === "restarted" ? `Sunshine restarted. ${done}.` : `${done}.`);
+      } else if (res.needsRestart && !restart) {
+        quietUntil = 0;
+        const reason = res.error
+          ? `Sunshine did not close the app (${res.error}).`
+          : "Without a Sunshine login saved in Eclipse, the app cannot be closed directly.";
+        confirmRestart(reason, () => void run(true));
+      } else {
+        quietUntil = 0;
+        notify(res.error ?? "Could not end the stream");
+      }
+    } catch (err) {
+      quietUntil = 0;
+      notify(`Could not end the stream: ${errorText(err)}`);
+    } finally {
+      setState({ endingIncoming: false });
+      refreshIncomingSoon();
+    }
+  };
+  await run(false);
+}
+
+/** Stopping Sunshine drops whoever is streaming from here: ask first in that case. */
+export function confirmStopSunshine(onStop: () => void): void {
+  const clients = getState().incoming?.clients ?? 0;
+  if (clients === 0) {
+    onStop();
+    return;
+  }
+  showModal(
+    <ConfirmModal
+      strTitle="Turn off Sunshine?"
+      strDescription={`${clients === 1 ? "A device is" : `${clients} devices are`} streaming from here and will be disconnected.`}
+      strOKButtonText="Turn off"
+      onOK={onStop}
+    />,
+  );
+}
+
+/**
+ * Create the first login of the Sunshine on this device with a generated
+ * password, so nothing has to be typed, and show it once.
+ */
+export async function createSunshineLoginAuto(): Promise<boolean> {
+  try {
+    const res = await backend.sunshineCreateLoginAuto();
+    if (!res.ok || !res.user || !res.password) {
+      notify(res.error ?? "Could not create the Sunshine login");
+      return false;
+    }
+    await loadInitialState(true);
+    showLocalSunshineLogin("Sunshine login created", res.user, res.password);
+    return true;
+  } catch (err) {
+    notify(`Could not create the Sunshine login: ${errorText(err)}`);
+    return false;
+  }
+}
+
+export async function revealSunshineLogin(): Promise<void> {
+  try {
+    const res = await backend.sunshineRevealLogin();
+    if (res.ok && res.user && res.password) showLocalSunshineLogin("Sunshine login", res.user, res.password);
+    else notify(res.error ?? "No Sunshine login saved");
+  } catch (err) {
+    notify(`Could not read the Sunshine login: ${errorText(err)}`);
+  }
+}
+
 export async function wakeHost(host: Host): Promise<void> {
   const res = await backend.wakeHost(host.uuid);
-  notify(res.ok ? `Magic packet sent to ${host.name}` : (res.error ?? "Wake-on-LAN failed"));
+  notify(res.ok ? `Waking ${host.name}...` : (res.error ?? "Wake-on-LAN failed"));
   if (res.ok) {
     // Hosts usually take a few seconds to come back; refresh a couple of times.
     setTimeout(() => void refreshHosts(true), 8000);

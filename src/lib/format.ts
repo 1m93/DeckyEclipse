@@ -72,3 +72,14 @@ export const FALLBACK_APPS: HostApp[] = [
   { id: "", name: "Desktop", hdr: false, hidden: false },
   { id: "", name: "Steam Big Picture", hdr: false, hidden: false },
 ];
+
+/** "under a minute", "12 min", "1 h 05 min". */
+export function formatDuration(ms: number): string {
+  const minutes = Math.floor(Math.max(0, ms) / 60000);
+  if (minutes < 1) return "under a minute";
+  if (minutes < 60) return `${minutes} min`;
+  return `${Math.floor(minutes / 60)} h ${String(minutes % 60).padStart(2, "0")} min`;
+}
+
+/** Accent colors of the two directions: playing from a PC, and sharing this device. */
+export const ACCENT = { play: "#1a9fff", share: "#f5b301" } as const;
