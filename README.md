@@ -4,6 +4,22 @@ Eclipse is a [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader) p
 [Moonlight](https://moonlight-stream.org) and [Sunshine](https://app.lizardbyte.dev/Sunshine/) from SteamOS
 Gaming Mode. Everything works with a controller, so you never need Desktop Mode.
 
+## Install
+
+1. Install [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader) and turn on its developer mode
+   (Decky settings → General → Developer mode).
+2. In Decky settings → Developer, use *Install plugin from URL* with the `.zip` link of the
+   [latest release](https://github.com/1m93/DeckyEclipse/releases/latest), or download the zip and use
+   *Install plugin from ZIP*.
+3. Open Eclipse in the Quick Access menu and pick what you use.
+
+Eclipse checks for new releases once a day and tells you; updating works the same way.
+
+## Releasing
+
+Bump `version` in `package.json`, optionally add `.github/release-notes/v<version>.md`, commit, then push a tag
+`v<version>`. The *Release* workflow checks, builds and publishes the zip.
+
 ## Features
 
 Both halves are optional. When you first open the plugin, it asks what you use: **play games from a PC**

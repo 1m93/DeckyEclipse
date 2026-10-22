@@ -1,0 +1,55 @@
+# Publishes a GitHub release for every version tag (v1.2.3): checks, builds the
+# Decky zip (frontend + native helpers) on a clean machine and attaches it.
+# Eclipse's update check looks for exactly this: a vX.Y.Z tag with a .zip asset.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Tag matches package.json
+        run: |
+          version="$(python3 -c 'import json; print(json.load(open("package.json"))["version"])')"
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match package.json version $version"
+            exit 1
+          fi
+
+      # The pnpm version comes from packageManager in package.json.
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: pnpm
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: python3 -m unittest discover -s tests
+
+      - name: Build the plugin zip
+        run: bash scripts/package.sh
+
+      - name: Release notes
+        id: notes
+        run: |
+          file=".github/release-notes/$GITHUB_REF_NAME.md"
+          if [ -f "$file" ]; then echo "path=$file" >> "$GITHUB_OUTPUT"; fi
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: out/*.zip
+          body_path: ${{ steps.notes.outputs.path }}
+          generate_release_notes: ${{ steps.notes.outputs.path == '' }}
+          fail_on_unmatched_files: true
