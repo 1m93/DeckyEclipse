@@ -1,0 +1,9 @@
+node_modules/
+dist/
+out/
+*.zip
+__pycache__/
+*.pyc
+.DS_Store
+.vscode/
+.idea/

@@ -1,0 +1,11 @@
+{
+  "name": "Eclipse",
+  "author": "1m93",
+  "flags": [],
+  "api_version": 1,
+  "publish": {
+    "tags": ["streaming", "moonlight", "sunshine"],
+    "description": "Stream from your Sunshine hosts with Moonlight straight from Gaming Mode, manage pairing, Wake-on-LAN and the local Sunshine server.",
+    "image": ""
+  }
+}
