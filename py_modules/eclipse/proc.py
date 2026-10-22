@@ -89,16 +89,19 @@ async def run_streaming(
     on_line: Callable[[str], None],
     timeout: float = 1800.0,
     home: Optional[str] = None,
+    input: Optional[bytes] = None,
 ) -> int:
     """Run a long command, forwarding each output line (stdout + stderr) to ``on_line``.
 
-    Cancelling the awaiting task terminates the whole process group, so helper
-    processes the command started (e.g. by a setup script) stop as well.
+    ``input`` is written to the command's stdin, which is then closed (used
+    for the sudo password). Cancelling the awaiting task terminates the whole
+    process group, so helper processes the command started (e.g. by a setup
+    script) stop as well.
     """
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
-            stdin=asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.DEVNULL if input is None else asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             env=clean_env(home),
@@ -107,6 +110,15 @@ async def run_streaming(
     except FileNotFoundError:
         on_line(f"{cmd[0]}: not found")
         return 127
+
+    if input is not None:
+        assert proc.stdin is not None
+        try:
+            proc.stdin.write(input)
+            await proc.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        proc.stdin.close()
 
     async def pump() -> None:
         assert proc.stdout is not None

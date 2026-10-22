@@ -8,11 +8,12 @@ import {
   Spinner,
   showModal,
 } from "@decky/ui";
-import { memo, useCallback, useMemo } from "react";
+import { memo, useCallback, useEffect, useMemo } from "react";
 import { FaPlay, FaStar } from "react-icons/fa";
 import { quitHostApp, streamApp, toggleFavorite, notify, wakeHost } from "../lib/actions";
-import { describeHost, FALLBACK_APPS, hostState, sortApps } from "../lib/format";
+import { describeHost, FALLBACK_APPS, hostState, openAppName, sortApps } from "../lib/format";
 import { addLibraryShortcut } from "../lib/steam";
+import { monitorLabel, refreshMonitors } from "../lib/monitors";
 import { updateSettings, useStore } from "../lib/store";
 import type { Host, HostApp, HostConfig } from "../types";
 import { StatusDot } from "./StatusDot";
@@ -29,6 +30,7 @@ const AppButton = memo(function AppButton({
   app,
   favorite,
   last,
+  open,
   disabled,
   onStart,
   onFavorite,
@@ -37,6 +39,8 @@ const AppButton = memo(function AppButton({
   app: HostApp;
   favorite: boolean;
   last: boolean;
+  /** The app is currently open on the host; streaming it resumes it. */
+  open: boolean;
   disabled: boolean;
   onStart: (name: string) => void;
   onFavorite: (name: string) => void;
@@ -45,18 +49,22 @@ const AppButton = memo(function AppButton({
   return (
     <DialogButton
       disabled={disabled}
-      preferredFocus={last}
+      preferredFocus={open || last}
       style={{ display: "flex", alignItems: "center", gap: 10, textAlign: "left", minHeight: 48 }}
       onClick={() => onStart(app.name)}
-      onOKActionDescription="Stream"
+      onOKActionDescription={open ? "Resume" : "Stream"}
       onSecondaryActionDescription={favorite ? "Unfavorite" : "Favorite"}
       onSecondaryButton={() => onFavorite(app.name)}
       onOptionsActionDescription="Add to library"
       onOptionsButton={() => onAddToLibrary(app.name)}
     >
-      <FaPlay size={12} style={{ opacity: last ? 1 : 0.4 }} />
+      <FaPlay size={12} style={{ opacity: open || last ? 1 : 0.4 }} />
       <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{app.name}</span>
-      {last && <span style={{ fontSize: 11, opacity: 0.7 }}>LAST PLAYED</span>}
+      {open ? (
+        <span style={{ fontSize: 11, fontWeight: 600, color: "#e5a50a" }}>OPEN</span>
+      ) : (
+        last && <span style={{ fontSize: 11, opacity: 0.7 }}>LAST PLAYED</span>
+      )}
       {app.hdr && <span style={{ fontSize: 11, opacity: 0.7 }}>HDR</span>}
       {favorite && <FaStar size={12} color="#e5a50a" />}
     </DialogButton>
@@ -71,29 +79,50 @@ function AppPickerModal({ host: initialHost, closeModal }: Props) {
   const waking = useStore((s) => s.waking[host.uuid]);
   const launchStage = useStore((s) => s.launchStage);
 
+  const hasLogin = Boolean(cfg.sunshineUser && cfg.sunshinePasswordSet);
+  const monitors = useStore((s) => s.monitors[host.uuid]);
   const displayOptions = useMemo(
     () =>
-      cfg.displays?.length
+      hasLogin
         ? [
-            { data: "", label: "Keep Sunshine's setting" },
-            ...cfg.displays.map((d) => ({ data: d.outputName, label: d.label })),
+            { data: "", label: "Don't switch (current monitor)" },
+            ...(cfg.displays ?? []).map((d) => ({ data: d.outputName, label: d.label })),
           ]
         : null,
-    [cfg.displays],
+    [cfg.displays, hasLogin],
   );
 
+  // Monitors may have changed since last time: refresh whenever the picker opens.
+  useEffect(() => {
+    if (hasLogin) void refreshMonitors(host);
+  }, [host, hasLogin]);
+
+  const monitorDescription = monitors?.loading
+    ? "Checking the host's monitors..."
+    : monitors?.error
+      ? monitors.error
+      : `Sunshine streams: ${monitorLabel(cfg.displays, monitors?.current ?? null)}${
+          cfg.display ? " · switching restarts Sunshine first (a few seconds)" : ""
+        }`;
+
   const usingFallback = host.apps.length === 0;
-  const apps = useMemo(() => sortApps(usingFallback ? FALLBACK_APPS : host.apps, cfg), [host.apps, cfg, usingFallback]);
+  const streamingHere = useStore((s) => s.session?.hostUuid === host.uuid);
+  const openApp = openAppName(host, status);
+  const apps = useMemo(
+    () => sortApps(usingFallback ? FALLBACK_APPS : host.apps, cfg, openApp),
+    [host.apps, cfg, usingFallback, openApp],
+  );
   const favorites = useMemo(() => new Set(cfg.favorites ?? []), [cfg.favorites]);
-  const state = hostState(status);
+  const state = hostState(status, streamingHere);
   const canWake = state === "offline" && Boolean(cfg.mac || host.mac || status?.mac);
 
   // Keep the picker open on failure so the user can retry or pick another app.
   const start = useCallback(
     async (name: string) => {
-      if (await streamApp(host, name)) closeModal?.();
+      // The monitor dropdown above already is the choice; don't ask again.
+      if (await streamApp(host, name, { monitorChosen: displayOptions !== null })) closeModal?.();
     },
-    [host, closeModal],
+    [host, closeModal, displayOptions],
   );
   const favorite = useCallback((name: string) => toggleFavorite(host, name), [host]);
   const addToLibrary = useCallback(
@@ -123,7 +152,7 @@ function AppPickerModal({ host: initialHost, closeModal }: Props) {
             {waking ? `Waking host... ${waking[0]}s / ${waking[1]}s` : (launchStage ?? "Preparing stream...")}
           </span>
         ) : (
-          describeHost(host, status, canWake)
+          describeHost(host, status, canWake, streamingHere)
         )}
       </div>
       {usingFallback && (
@@ -134,11 +163,11 @@ function AppPickerModal({ host: initialHost, closeModal }: Props) {
       )}
       {displayOptions && (
         <DropdownItem
-          label="Host display"
-          description="Switching restarts Sunshine on the host, which takes a few seconds."
+          label="Monitor"
+          description={monitorDescription}
           rgOptions={displayOptions}
           selectedOption={cfg.display ?? ""}
-          disabled={launching}
+          disabled={launching || monitors?.loading}
           onChange={(opt) => updateSettings({ hosts: { [host.uuid]: { display: opt.data || null } } }, 0)}
         />
       )}
@@ -148,7 +177,8 @@ function AppPickerModal({ host: initialHost, closeModal }: Props) {
             key={app.name}
             app={app}
             favorite={favorites.has(app.name)}
-            last={app.name === cfg.lastApp}
+            last={app.name === cfg.lastApp && !openApp}
+            open={app.name === openApp}
             disabled={launching}
             onStart={start}
             onFavorite={favorite}
@@ -166,6 +196,15 @@ function AppPickerModal({ host: initialHost, closeModal }: Props) {
           {state === "busy" && (
             <DialogButton style={{ flex: 1 }} onClick={() => void quitHostApp(host)}>
               Quit running app
+            </DialogButton>
+          )}
+          {hasLogin && (
+            <DialogButton
+              style={{ flex: 1 }}
+              disabled={monitors?.loading || launching}
+              onClick={() => void refreshMonitors(host, true)}
+            >
+              Rescan monitors
             </DialogButton>
           )}
           <DialogButton

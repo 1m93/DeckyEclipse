@@ -37,7 +37,7 @@ function PairModal({ address, host, creds = null, closeModal }: Props) {
       closeModal={closeModal}
       onCancel={closeModal}
       onOK={() => {
-        if (pairing) void launchPairing(pairing.pin);
+        if (pairing) void launchPairing(pairing.pin, address || host?.addresses[0]?.address || host?.name || "");
         closeModal?.();
       }}
     >

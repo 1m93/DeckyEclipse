@@ -51,7 +51,8 @@ ssh "${SSH_OPTS[@]}" -t "$USER_NAME@$HOST" "
     exit 1
   fi
   set -e
-  sudo rsync -a --delete /tmp/$NAME-deploy/ \"\$HOME/homebrew/plugins/$NAME/\"
+  # Root-owned like a store install: the Sunshine installer runs from here as root.
+  sudo rsync -a --delete --chown=root:root /tmp/$NAME-deploy/ \"\$HOME/homebrew/plugins/$NAME/\"
   sudo systemctl restart plugin_loader
   rm -rf /tmp/$NAME-deploy
   echo 'Deployed. Decky is restarting.'

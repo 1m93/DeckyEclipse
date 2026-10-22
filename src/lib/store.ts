@@ -17,6 +17,15 @@ import type {
 } from "../types";
 import { deepMerge, mergePatches } from "./merge";
 
+export interface MonitorState {
+  loading: boolean;
+  /** `output_name` Sunshine uses now; "" is its default monitor, null unknown. */
+  current: string | null;
+  /** When Sunshine last listed its monitors (host clock). */
+  detectedAt: string | null;
+  error: string | null;
+}
+
 export interface State {
   ready: boolean;
   loadError: string | null;
@@ -43,6 +52,8 @@ export interface State {
   launching: string | null;
   /** Current step while preparing a stream, e.g. "Switching host display...". */
   launchStage: string | null;
+  /** Live monitor info per host uuid, refreshed when it matters. */
+  monitors: Record<string, MonitorState>;
   /** Page and host the full settings page should open on. */
   pageTarget: { page: string; host: string | null };
 }
@@ -70,6 +81,7 @@ const initialState: State = {
   session: null,
   launching: null,
   launchStage: null,
+  monitors: {},
   pageTarget: { page: "hosts", host: null },
 };
 
@@ -190,6 +202,16 @@ export function refreshHosts(force = false): Promise<void> {
     }
   })();
   return inFlight;
+}
+
+/**
+ * Polling pauses during a stream, so host states are stale when it ends.
+ * Re-probe shortly after (and once more, since quitting the app on the host
+ * can take a few seconds).
+ */
+export function refreshAfterStream(): void {
+  window.setTimeout(() => void refreshHosts(true), 2000);
+  window.setTimeout(() => void refreshHosts(true), 8000);
 }
 
 function schedulePoll(): void {

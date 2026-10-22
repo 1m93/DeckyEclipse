@@ -9,7 +9,7 @@ import {
 } from "@decky/ui";
 import { useCallback, useEffect, useState } from "react";
 import { backend } from "../backend";
-import { FEATURE_LABELS, installFeature, notify, uninstallApp, updateApp } from "../lib/actions";
+import { FEATURE_LABELS, installFeature, notify, uninstallApp, uninstallSunshineFlatpak, updateApp } from "../lib/actions";
 import { useStore } from "../lib/store";
 import type { AppStatus, AppsStatus, AppUpdateCheck, Feature } from "../types";
 import { InstallProgress } from "./InstallProgress";
@@ -21,9 +21,23 @@ const DATA_DESCRIPTION: Record<Feature, string> = {
   sunshine: "Sunshine config, web UI credentials and paired clients.",
 };
 
-function UninstallModal({ feature, closeModal }: { feature: Feature; closeModal?: () => void }) {
+/**
+ * `native`: Sunshine for Gaming Mode. `flatpakOnly`: remove the Sunshine
+ * Flatpak left next to it.
+ */
+function UninstallModal({
+  feature,
+  native = false,
+  flatpakOnly = false,
+  closeModal,
+}: {
+  feature: Feature;
+  native?: boolean;
+  flatpakOnly?: boolean;
+  closeModal?: () => void;
+}) {
   const [deleteData, setDeleteData] = useState(false);
-  const label = FEATURE_LABELS[feature];
+  const label = flatpakOnly ? "the Sunshine Flatpak" : FEATURE_LABELS[feature];
   return (
     <ConfirmModal
       strTitle={`Uninstall ${label}?`}
@@ -33,7 +47,7 @@ function UninstallModal({ feature, closeModal }: { feature: Feature; closeModal?
       onCancel={closeModal}
       onOK={() => {
         closeModal?.();
-        void uninstallApp(feature, deleteData);
+        void (flatpakOnly ? uninstallSunshineFlatpak(deleteData) : uninstallApp(feature, deleteData, native));
       }}
     >
       <ToggleField
@@ -48,6 +62,7 @@ function UninstallModal({ feature, closeModal }: { feature: Feature; closeModal?
 
 function describe(status: AppStatus): string {
   if (!status.installed) return "Not installed";
+  if (status.installation === "eclipse") return `${status.version ? `Version ${status.version}` : "Installed"} · Sunshine for Gaming Mode`;
   if (!status.managed) return "Installed outside Flatpak (native or custom command). Manage it with the tool you installed it with.";
   const where = status.installation === "user" ? "Flatpak, this user" : `Flatpak, ${status.installation ?? "system"}`;
   return `${status.version ? `Version ${status.version}` : "Installed"} · ${where}`;
@@ -57,6 +72,7 @@ function AppRow({ feature, status, onChanged }: { feature: Feature; status: AppS
   const busy = useStore((s) => s.installing);
   const [check, setCheck] = useState<AppUpdateCheck | "checking" | null>(null);
   const label = FEATURE_LABELS[feature];
+  const native = status.installation === "eclipse";
 
   if (busy === feature) {
     return (
@@ -76,7 +92,7 @@ function AppRow({ feature, status, onChanged }: { feature: Feature; status: AppS
 
   const checkText =
     check === "checking"
-      ? "Checking Flathub..."
+      ? "Checking for updates..."
       : check?.ok
         ? check.available
           ? `Update available${check.version ? `: ${check.version}` : ""}`
@@ -98,7 +114,7 @@ function AppRow({ feature, status, onChanged }: { feature: Feature; status: AppS
               layout="below"
               disabled={busy !== null}
               onClick={async () => {
-                if (await updateApp(feature)) {
+                if (await updateApp(feature, native)) {
                   setCheck(null);
                   onChanged();
                 }
@@ -115,10 +131,20 @@ function AppRow({ feature, status, onChanged }: { feature: Feature; status: AppS
           <ButtonItem
             layout="below"
             disabled={busy !== null}
-            onClick={() => showModal(<UninstallModal feature={feature} />)}
+            onClick={() => showModal(<UninstallModal feature={feature} native={native} />)}
           >
             Uninstall {label}
           </ButtonItem>
+          {status.alsoFlatpak && (
+            <ButtonItem
+              layout="below"
+              description="Sunshine for Gaming Mode replaces it; the Flatpak cannot stream Gaming Mode."
+              disabled={busy !== null}
+              onClick={() => showModal(<UninstallModal feature={feature} flatpakOnly />)}
+            >
+              Remove the Sunshine Flatpak
+            </ButtonItem>
+          )}
         </>
       )}
     </>
@@ -141,7 +167,7 @@ export function AppsSection() {
     <DialogControlsSection>
       <DialogControlsSectionHeader>Apps</DialogControlsSectionHeader>
       {!status ? (
-        <Field description="Checking installed apps..." />
+        <Field label="Checking installed apps..." />
       ) : (
         FEATURES.map((feature) => (
           <AppRow key={feature} feature={feature} status={status[feature]} onChanged={() => void refresh()} />

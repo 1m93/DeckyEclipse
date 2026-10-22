@@ -1,10 +1,29 @@
 import { toaster } from "@decky/api";
 import { Navigation } from "@decky/ui";
 import { backend } from "../backend";
-import type { AppOperation, Feature, Host, HostConfig, InstallResult, PluginUpdateCheck } from "../types";
-import { flushSettings, getState, loadInitialState, refreshHosts, setState, updateSettings } from "./store";
+import type {
+  AppOperation,
+  Feature,
+  Host,
+  HostConfig,
+  InstallResult,
+  PluginUpdateCheck,
+  StreamSession,
+} from "../types";
+import {
+  flushSettings,
+  getState,
+  loadInitialState,
+  refreshAfterStream,
+  refreshHosts,
+  setState,
+  updateSettings,
+} from "./store";
+import { chooseMonitor } from "../components/MonitorChoiceModal";
+import { askSudoPassword } from "../components/SudoPasswordModal";
+import { hasSunshineLogin } from "./monitors";
 import { openEclipsePage } from "./navigation";
-import { ensureLauncherShortcut, runApp, terminateApp } from "./steam";
+import { ensureLauncherShortcut, markInternalLaunch, runApp, terminateApp } from "./steam";
 
 const TITLE = "Eclipse";
 /** Drop a launch that Steam never reported as running (Moonlight failed to start). */
@@ -18,20 +37,38 @@ function errorText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-/** Launch the shared shortcut, which consumes the request the backend just wrote. */
-async function launchPending(): Promise<number> {
+/**
+ * Launch the shared shortcut, which consumes the request the backend just wrote.
+ * `internal` launches (quitting a host app) are not tracked as stream sessions.
+ */
+async function launchPending(internal = false): Promise<number> {
   const appId = await ensureLauncherShortcut();
+  if (internal) markInternalLaunch();
   runApp(appId);
   return appId;
 }
 
-/** Prepare and launch a stream. Resolves to true once Moonlight was launched. */
-export async function streamApp(host: Host, appName: string): Promise<boolean> {
+/**
+ * Prepare and launch a stream. Resolves to true once Moonlight was launched.
+ * `monitorChosen` skips the "which monitor?" prompt (the app picker already
+ * shows a monitor choice).
+ */
+export async function streamApp(
+  host: Host,
+  appName: string,
+  { monitorChosen = false }: { monitorChosen?: boolean } = {},
+): Promise<boolean> {
   const { launching, session } = getState();
   if (launching) return false;
   if (session?.confirmed) {
     notify("A stream is already running. End it first.");
     return false;
+  }
+
+  if (!monitorChosen && getState().settings?.hosts[host.uuid]?.askMonitor && hasSunshineLogin(host.uuid)) {
+    const choice = await chooseMonitor(host);
+    if (choice === undefined) return false;
+    updateSettings({ hosts: { [host.uuid]: { display: choice } } }, 0);
   }
 
   setState({ launching: host.uuid, launchStage: null });
@@ -40,7 +77,16 @@ export async function streamApp(host: Host, appName: string): Promise<boolean> {
   const offline = getState().status[host.uuid]?.online === false;
   if (offline) notify(`Waking ${host.name}...`);
   try {
-    const res = await backend.prepareStream(host.uuid, appName);
+    let res = await backend.prepareStream(host.uuid, appName);
+    if (!res.ok && res.monitorMissing) {
+      // The chosen monitor was unplugged: let the user pick from a fresh list, then retry once.
+      notify(res.error ?? "The selected monitor is gone");
+      const choice = await chooseMonitor(host);
+      if (choice === undefined) return false;
+      updateSettings({ hosts: { [host.uuid]: { display: choice } } }, 0);
+      await flushSettings();
+      res = await backend.prepareStream(host.uuid, appName);
+    }
     if (!res.ok) {
       notify(res.error ?? "Could not start the stream");
       return false;
@@ -84,12 +130,56 @@ export async function openMoonlight(): Promise<void> {
   }
 }
 
+/** How long to wait for Steam to report the stream as stopped before forcing it. */
+const END_STREAM_FALLBACK_MS = 3000;
+const handledEnds = new Set<number>();
+
+/**
+ * Runs once per stream, however it ended (End stream, Exit game, quitting
+ * Moonlight). Refreshes host states and, when "Quit app after stream" is on,
+ * makes sure the session on the host ends too.
+ */
+export function handleStreamEnded(session: StreamSession): void {
+  if (handledEnds.has(session.startedAt)) return;
+  handledEnds.add(session.startedAt);
+  refreshAfterStream();
+  if (session.pairAddress) {
+    void reportPairing(session.pairAddress);
+    return;
+  }
+  if (!session.hostUuid) return;
+
+  void (async () => {
+    try {
+      const res = await backend.quitAfterStream(session.hostUuid);
+      if (!res.ok) {
+        console.warn("[Eclipse] quit after stream failed", res.error);
+      } else if (res.launch) {
+        // No Sunshine credentials: let Moonlight quit the app (a brief window).
+        await launchPending(true);
+      }
+    } catch (err) {
+      console.error("[Eclipse] quit after stream failed", err);
+    }
+  })();
+}
+
 export async function endStream(): Promise<void> {
   const { session } = getState();
-  if (session) terminateApp(session.appId);
-  // Fallback for Moonlight processes Steam does not track (e.g. started outside Steam).
-  setTimeout(() => void backend.stopStream(), 1500);
-  setState({ session: null });
+  if (!session) {
+    void backend.stopStream();
+    return;
+  }
+  terminateApp(session.appId);
+  // Steam normally reports the app as stopped and handleStreamEnded runs from
+  // there. If it does not, force-stop Moonlight and finish the job here.
+  setTimeout(() => {
+    const current = getState().session;
+    if (current?.startedAt !== session.startedAt) return;
+    void backend.stopStream();
+    setState({ session: null });
+    handleStreamEnded(session);
+  }, END_STREAM_FALLBACK_MS);
 }
 
 export async function wakeHost(host: Host): Promise<void> {
@@ -110,7 +200,7 @@ export async function quitHostApp(host: Host): Promise<void> {
       return;
     }
     if (res.launch) {
-      await launchPending();
+      await launchPending(true);
     } else {
       notify(`Closed the running app on ${host.name}`);
       void refreshHosts(true);
@@ -134,13 +224,46 @@ export async function preparePairing(
   return { pin: res.pin, autoSubmit: Boolean(res.autoSubmit) };
 }
 
-export async function launchPairing(pin: string): Promise<void> {
+/**
+ * Open Moonlight to pair with `address`. The session is tagged so that, when
+ * Moonlight closes, the outcome (paired or not) is reported.
+ */
+export async function launchPairing(pin: string, address: string): Promise<void> {
   try {
-    await launchPending();
+    const appId = await launchPending();
+    setState({
+      session: {
+        appId,
+        hostUuid: "",
+        hostName: address,
+        appName: "Pairing",
+        startedAt: Date.now(),
+        confirmed: false,
+        pairAddress: address,
+      },
+    });
     // Toasts stay visible on top of Moonlight, so the PIN is always at hand.
     notify(`Pairing PIN: ${pin}`, "Eclipse pairing", 30000);
   } catch (err) {
     notify(`Could not launch Moonlight: ${errorText(err)}`);
+  }
+}
+
+/** Tell the user how pairing went once Moonlight's pairing window closed. */
+async function reportPairing(address: string): Promise<void> {
+  // Give Moonlight a moment to write its config.
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+  try {
+    const outcome = await backend.pairingOutcome(address);
+    if (outcome.paired) {
+      notify(`Paired with ${outcome.host ?? address} ✓`, "Eclipse pairing");
+      await loadInitialState(true);
+      void refreshHosts(true);
+    } else {
+      notify(`Pairing with ${address} did not complete. Check the PIN and try again.`, "Eclipse pairing");
+    }
+  } catch (err) {
+    console.error("[Eclipse] pairing outcome check failed", err);
   }
 }
 
@@ -184,17 +307,38 @@ async function runAppOperation(
   }
 }
 
-/** Install the app behind a feature from Flathub. Only ever triggered by the user. */
-export function installFeature(feature: Feature): Promise<boolean> {
-  return runAppOperation(feature, "install", feature === "moonlight" ? backend.installMoonlight : backend.installSunshine);
+/**
+ * Install the app behind a feature: Moonlight from Flathub, Sunshine as
+ * Sunshine for Gaming Mode (asks for the sudo password). Only ever triggered by the user.
+ */
+export async function installFeature(feature: Feature): Promise<boolean> {
+  if (feature === "moonlight") return runAppOperation(feature, "install", backend.installMoonlight);
+  const password = await askSudoPassword("Installing Sunshine for Gaming Mode");
+  return password !== null && runAppOperation(feature, "install", () => backend.installSunshine(password));
 }
 
-export function updateApp(feature: Feature): Promise<boolean> {
-  return runAppOperation(feature, "update", () => backend.updateApp(feature));
+/** `native`: Sunshine for Gaming Mode, which needs the sudo password. */
+export async function updateApp(feature: Feature, native = false): Promise<boolean> {
+  const password = native ? await askSudoPassword("Updating Sunshine for Gaming Mode") : null;
+  if (native && password === null) return false;
+  return runAppOperation(feature, "update", () => backend.updateApp(feature, password));
 }
 
-export function uninstallApp(feature: Feature, deleteData: boolean): Promise<boolean> {
-  return runAppOperation(feature, "uninstall", () => backend.uninstallApp(feature, deleteData));
+export async function uninstallApp(feature: Feature, deleteData: boolean, native = false): Promise<boolean> {
+  const password = native ? await askSudoPassword("Removing Sunshine for Gaming Mode") : null;
+  if (native && password === null) return false;
+  return runAppOperation(feature, "uninstall", () => backend.uninstallApp(feature, deleteData, password));
+}
+
+/** Reinstall Sunshine for Gaming Mode: restores its capture permission and updates its helpers. */
+export async function repairSunshine(): Promise<boolean> {
+  const password = await askSudoPassword("Repairing Sunshine for Gaming Mode");
+  return password !== null && runAppOperation("sunshine", "install", () => backend.repairSunshine(password));
+}
+
+/** Remove a Sunshine Flatpak left next to Sunshine for Gaming Mode. */
+export function uninstallSunshineFlatpak(deleteData: boolean): Promise<boolean> {
+  return runAppOperation("sunshine", "uninstall", () => backend.uninstallSunshineFlatpak(deleteData));
 }
 
 export async function cancelInstall(): Promise<void> {

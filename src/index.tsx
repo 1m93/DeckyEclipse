@@ -3,9 +3,9 @@ import { staticClasses } from "@decky/ui";
 import { FaMoon } from "react-icons/fa";
 import { Events } from "./backend";
 import { QuickPanel } from "./components/QuickPanel";
-import { checkPluginUpdate, notify } from "./lib/actions";
+import { checkPluginUpdate, handleStreamEnded, notify } from "./lib/actions";
 import { ROUTE } from "./lib/navigation";
-import { registerLifetimeTracking } from "./lib/steam";
+import { registerLifetimeTracking, setStreamEndedHandler } from "./lib/steam";
 import { flushSettings, loadInitialState, setState, stopAllPolling } from "./lib/store";
 import { EclipsePage } from "./pages/EclipsePage";
 
@@ -30,6 +30,7 @@ export default definePlugin(() => {
   // Lifetime tracking needs the launcher id, so load state eagerly (one cheap call).
   // The daily update check runs afterwards, off the critical path.
   void loadInitialState().then(() => checkPluginUpdate(true));
+  setStreamEndedHandler(handleStreamEnded);
   const unregisterLifetime = registerLifetimeTracking();
 
   return {

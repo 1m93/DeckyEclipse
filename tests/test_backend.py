@@ -13,11 +13,13 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "py_modules"))
 
-from eclipse import REQUEST_FILE, display, flatpak, host_display, launch, network, proc, updates  # noqa: E402
+from eclipse import REQUEST_FILE, diagnostics, display, flatpak, host_display, launch, network, proc, updates  # noqa: E402
 from eclipse.moonlight import build_stream_args  # noqa: E402
 from eclipse.moonlight_config import hosts_from_sections, parse_ini  # noqa: E402
 from eclipse.presets import AUTO_PRESET, STREAM_DEFAULTS, all_presets, effective_stream  # noqa: E402
 from eclipse.settings import SettingsStore, deep_merge, mask_secrets, strip_masked_fields  # noqa: E402
+from eclipse import sunshine  # noqa: E402
+from eclipse import sunshine_native  # noqa: E402
 
 SAMPLE_CONF = r"""
 [General]
@@ -66,6 +68,13 @@ class MoonlightConfigTests(unittest.TestCase):
         self.assertEqual(names, ["Desktop", "Hidden App", "Game, The Sequel"])
         self.assertTrue(host["apps"][0]["hdr"])
         self.assertTrue(host["apps"][1]["hidden"])
+
+    def test_paired_flag_follows_server_certificate(self):
+        conf = SAMPLE_CONF.replace(r"1\srvcert=@ByteArray(-----BEGIN CERTIFICATE-----\n)",
+                                   r"1\srvcert=@ByteArray(-----BEGIN CERTIFICATE-----\nMIIC" + "A" * 64 + r"\n-----END CERTIFICATE-----\n)")
+        self.assertTrue(hosts_from_sections(parse_ini(conf))[0]["paired"])
+        unpaired = SAMPLE_CONF.replace(r"1\srvcert=@ByteArray(-----BEGIN CERTIFICATE-----\n)", r"1\srvcert=@ByteArray()")
+        self.assertFalse(hosts_from_sections(parse_ini(unpaired))[0]["paired"])
 
     def test_decodes_mac_bytearray(self):
         host = hosts_from_sections(parse_ini(SAMPLE_CONF))[0]
@@ -265,6 +274,37 @@ class HostDisplayTests(unittest.TestCase):
         self.assertEqual([d["outputName"] for d in displays], ["DP-1", "HDMI-A-1"])
         self.assertEqual(displays[1]["label"], "HDMI-A-1 (Samsung TV)")
 
+    def test_only_latest_kms_enumeration_counts(self):
+        log = KMS_LOG + (
+            "[2026-10-02 08:00:00.000]: Info: -------- Start of KMS monitor list --------\n"
+            "[2026-10-02 08:00:00.001]: Info: Monitor 0 is DP-1: LG ULTRAGEAR\n"
+            "[2026-10-02 08:00:00.002]: Info: --------- End of KMS monitor list ---------\n"
+            "[2026-10-02 08:00:05.000]: Info: Monitor 9 is HDMI-A-9: unrelated line after the block\n"
+        )
+        displays, detected_at = host_display.parse_displays_with_time(log)
+        self.assertEqual([d["outputName"] for d in displays], ["DP-1"], "the unplugged TV must not linger")
+        self.assertEqual(detected_at, "2026-10-02 08:00:00")
+
+    def test_stream_blocked_when_selected_monitor_is_gone(self):
+        original = host_display.SunshineApi
+        host_display.SunshineApi = lambda *a, **k: FakeSunshine({"output_name": "DP-1"})
+        try:
+            host = {"uuid": "u", "name": "PC", "addresses": [{"address": "h", "port": 47989}]}
+            settings = {"hosts": {"u": {
+                "display": "HDMI-A-2", "sunshineUser": "a", "sunshinePassword": "b",
+                "displays": [{"outputName": "HDMI-A-2", "label": "Old TV"}],
+            }}}
+            result = host_display.apply_host_selection(settings, host, "/nonexistent")
+            self.assertFalse(result["ok"])
+            self.assertTrue(result["missing"])
+            self.assertIn("Old TV", result["error"])
+            settings["hosts"]["u"]["display"] = "HDMI-A-1"  # present in KMS_LOG
+            with tempfile.TemporaryDirectory() as tmp:
+                ok = host_display.apply_host_selection(settings, host, tmp)
+            self.assertEqual((ok["ok"], ok["changed"]), (True, True))
+        finally:
+            host_display.SunshineApi = original
+
     def test_parse_windows_log(self):
         displays = host_display.parse_displays(WINDOWS_LOG)
         self.assertEqual(displays[0]["outputName"], "{64243705-4020-5895-b923-adc862c3457e}")
@@ -280,6 +320,10 @@ class HostDisplayTests(unittest.TestCase):
             self.assertEqual(api.posts[-1], {"sunshine_name": "PC", "encoder": "nvenc", "output_name": "HDMI-A-1"})
             with open(backup) as fh:
                 self.assertEqual(json.load(fh)["output_name"], "DP-1")
+
+    def test_current_output(self):
+        self.assertEqual(host_display.current_output(FakeSunshine({"output_name": "HDMI-A-1"}))["current"], "HDMI-A-1")
+        self.assertEqual(host_display.current_output(FakeSunshine({}))["current"], "", "empty means Sunshine's default")
 
     def test_switch_is_noop_when_unchanged(self):
         api = FakeSunshine({"output_name": "DP-1"})
@@ -385,6 +429,188 @@ class FlatpakTests(unittest.TestCase):
         self.assertIn("--user", self.calls[-1])
 
 
+class DiagnosticsTests(unittest.TestCase):
+    def setUp(self):
+        self._run = proc.run
+        self._probe = network.probe
+        self.services = {}
+
+        async def fake_run(cmd, timeout=10.0, home=None):
+            if cmd[:2] == ["ip", "-4"]:
+                return 0, (
+                    "3: docker0    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0\n"
+                    "2: wlan0    inet 192.168.2.47/24 brd 192.168.2.255 scope global dynamic wlan0\n"
+                ), ""
+            name = cmd[-1]
+            state = self.services.get(name)
+            if "list-unit-files" in cmd:
+                return 0, (f"{name} enabled\n" if state is not None else ""), ""
+            return (0 if state else 3), "", ""
+
+        proc.run = fake_run
+
+    def tearDown(self):
+        proc.run = self._run
+        network.probe = self._probe
+
+    def test_flatpak_capture_limitation_is_detected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_dir = os.path.join(tmp, ".var", "app", "dev.lizardbyte.app.Sunshine", "config", "sunshine")
+            os.makedirs(log_dir)
+            with open(os.path.join(log_dir, "sunshine.log"), "w") as fh:
+                fh.write("[2026-10-22 13:00:00.000]: Error: AppImage and Flatpak do not support KMS capture. "
+                         "Use another capture method.\n")
+            result = asyncio.run(diagnostics.run({"running": True}, tmp))
+            capture = next(c for c in result["checks"] if c["id"] == "capture")
+            self.assertFalse(capture["ok"])
+            self.assertIn("Error 503", capture["hint"])
+
+    def test_lan_addresses_physical_first(self):
+        ips = asyncio.run(diagnostics.local_ipv4())
+        self.assertEqual([i["address"] for i in ips], ["192.168.2.47", "172.17.0.1"])
+
+    def test_discovery_problem_is_reported_with_hint(self):
+        async def fake_probe(address, port, timeout=1.5):
+            return {"online": True, "busy": False, "hostname": "steamdeck"}
+
+        network.probe = fake_probe
+        self.services = {"avahi-daemon.service": False}
+        result = asyncio.run(diagnostics.run({"running": True}, "/nonexistent"))
+        checks = {c["id"]: c for c in result["checks"]}
+        self.assertTrue(checks["running"]["ok"])
+        self.assertTrue(checks["server"]["ok"])
+        self.assertFalse(checks["discovery"]["ok"])
+        self.assertIn("avahi-daemon", checks["discovery"]["hint"])
+        self.assertTrue(checks["firewall"]["ok"], "no firewall installed")
+        self.assertEqual(checks["running"]["hint"], "", "passing checks carry no hint")
+
+
+class FakePairApi:
+    """Mimics SunshineApi pairing calls for the new (ids) or legacy (PIN only) API."""
+
+    def __init__(self, new_api, pending=(), pin_ok=True, appear=True):
+        self.new_api, self.pending, self.pin_ok, self.appear = new_api, list(pending), pin_ok, appear
+        self.paired = [{"uuid": "old", "name": "Old phone", "enabled": True}]
+        self.sent = []
+
+    async def pending_pairings(self):
+        if not self.new_api:
+            return {"ok": True, "supported": False, "items": [], "error": None}
+        return {"ok": True, "supported": True, "items": self.pending, "error": None}
+
+    async def submit_pin(self, pin, name, pairing_id=None):
+        self.sent.append((pin, pairing_id))
+        if self.pin_ok and self.appear:
+            self.paired.append({"uuid": "new", "name": "Pixel 8", "enabled": True})
+        return {"ok": self.pin_ok, "status": 200, "error": None if self.pin_ok else "rejected"}
+
+    async def clients(self):
+        return {"ok": True, "items": list(self.paired), "error": None}
+
+
+class PairingTests(unittest.TestCase):
+    def setUp(self):
+        self._wait = sunshine.LEGACY_PAIR_WAIT_S
+        sunshine.LEGACY_PAIR_WAIT_S = 2.0
+
+    def tearDown(self):
+        sunshine.LEGACY_PAIR_WAIT_S = self._wait
+
+    def test_new_api_uses_the_pending_request(self):
+        api = FakePairApi(True, pending=[{"id": "a" * 32, "name": "Pixel 8", "address": "192.168.2.10"}])
+        result = asyncio.run(sunshine.pair_client(api, "1234", "Deck"))
+        self.assertEqual((result["ok"], result["client"]), (True, "Pixel 8"))
+        self.assertEqual(api.sent, [("1234", "a" * 32)])
+
+    def test_new_api_without_waiting_device(self):
+        result = asyncio.run(sunshine.pair_client(FakePairApi(True), "1234", "Deck"))
+        self.assertFalse(result["ok"])
+        self.assertIn("waiting", result["error"])
+
+    def test_new_api_wrong_pin(self):
+        api = FakePairApi(True, pending=[{"id": "b" * 32, "name": "TV", "address": ""}], pin_ok=False)
+        result = asyncio.run(sunshine.pair_client(api, "0000", "Deck"))
+        self.assertFalse(result["paired"])
+        self.assertIn("wrong PIN", result["error"])
+
+    def test_several_waiting_devices_need_a_choice(self):
+        pending = [{"id": "c" * 32, "name": "A", "address": ""}, {"id": "d" * 32, "name": "B", "address": ""}]
+        result = asyncio.run(sunshine.pair_client(FakePairApi(True, pending=pending), "1234", "Deck"))
+        self.assertEqual(len(result["choose"]), 2)
+
+    def test_legacy_api_confirms_with_client_list(self):
+        result = asyncio.run(sunshine.pair_client(FakePairApi(False), "1234", "Deck"))
+        self.assertEqual((result["paired"], result["client"]), (True, "Pixel 8"))
+
+    def test_old_sunshine_without_pending_endpoint_uses_legacy_flow(self):
+        """Sunshine 2026.516 answers GET /api/pin with 404; pairing must still work."""
+        class Old(sunshine.SunshineApi):
+            def __init__(self):
+                super().__init__("127.0.0.1", "u", "p")
+                self.paired = [{"uuid": "old", "name": "Old phone"}]
+                self.sent = []
+
+            def _request(self, method, path, body, timeout, limit=0, raw_text=False):
+                if (method, path) == ("GET", "/api/pin"):
+                    return 404, None
+                if (method, path) == ("POST", "/api/pin"):
+                    self.sent.append(body)
+                    self.paired.append({"uuid": "new", "name": "Pixel 8"})
+                    return 200, {"status": "true"}
+                if (method, path) == ("GET", "/api/clients/list"):
+                    return 200, {"status": True, "named_certs": list(self.paired)}
+                raise AssertionError((method, path))
+
+        api = Old()
+        result = asyncio.run(sunshine.pair_client(api, "1234", "Deck"))
+        self.assertEqual((result["ok"], result["client"]), (True, "Pixel 8"))
+        self.assertNotIn("pairing_id", api.sent[0], "the old API takes the PIN only")
+
+    def test_legacy_api_reports_when_device_never_appears(self):
+        result = asyncio.run(sunshine.pair_client(FakePairApi(False, appear=False), "1234", "Deck"))
+        self.assertFalse(result["paired"])
+        self.assertIn("did not finish pairing", result["error"])
+
+
+class SunshineApiTests(unittest.TestCase):
+    def test_first_run_redirect_is_not_followed(self):
+        """Sunshine without a login redirects to /welcome (307); following it would look like success."""
+        import http.server
+        import threading
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/welcome":
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b"<html>welcome</html>")
+                    return
+                self.send_response(307)
+                self.send_header("Location", "/welcome")
+                self.end_headers()
+
+            do_POST = do_GET
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            api = sunshine.SunshineApi("127.0.0.1", "", "")
+            api._url = lambda path: f"http://127.0.0.1:{server.server_port}{path}"
+            result = asyncio.run(api.test())
+            self.assertFalse(result["ok"])
+            self.assertTrue(result["needsSetup"])
+            self.assertIn("no login yet", result["error"])
+            pending = asyncio.run(api.pending_pairings())
+            self.assertFalse(pending["ok"])
+            outcome = asyncio.run(sunshine.pair_client(api, "1234", "Deck"))
+            self.assertIn("no login yet", outcome["error"])
+        finally:
+            server.shutdown()
+
+
 class SettingsTests(unittest.TestCase):
     def test_deep_merge_deletes_with_none(self):
         merged = deep_merge({"a": {"b": 1, "c": 2}}, {"a": {"b": None, "d": 3}})
@@ -404,6 +630,26 @@ class SettingsTests(unittest.TestCase):
             reloaded = SettingsStore(store.path)
             self.assertEqual(reloaded.data["sunshine"]["user"], "admin")
 
+    def test_migration_enables_quit_after_for_old_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "settings.json")
+            with open(path, "w") as fh:
+                json.dump({"version": 1, "stream": {"quitAppAfter": False, "fps": 90}}, fh)
+            store = SettingsStore(path)
+            self.assertTrue(store.data["stream"]["quitAppAfter"])
+            self.assertEqual(store.data["stream"]["fps"], 90, "other values are kept")
+            with open(path) as fh:
+                self.assertEqual(json.load(fh)["version"], 2, "migration is persisted")
+            # Once migrated, the user's choice is respected again.
+            store.update({"stream": {"quitAppAfter": False}})
+            self.assertFalse(SettingsStore(path).data["stream"]["quitAppAfter"])
+
+    def test_fresh_install_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SettingsStore(os.path.join(tmp, "settings.json"))
+            self.assertTrue(store.data["stream"]["quitAppAfter"])
+            self.assertFalse(os.path.exists(store.path), "nothing is written until something changes")
+
     def test_mask_nested_host_secret(self):
         masked = mask_secrets({"hosts": {"x": {"sunshinePassword": "p", "sunshineUser": "u"}}})
         self.assertEqual(masked, {"hosts": {"x": {"sunshinePasswordSet": True, "sunshineUser": "u"}}})
@@ -414,11 +660,15 @@ class NetworkTests(unittest.TestCase):
         body = (
             "<?xml version='1.0'?><root status_code=\"200\"><hostname>PC</hostname>"
             "<appversion>7.1.431.-1</appversion><mac>AA:BB:CC:DD:EE:FF</mac>"
-            "<currentgame>0</currentgame><state>SUNSHINE_SERVER_BUSY</state></root>"
+            "<currentgame>881448767</currentgame><state>SUNSHINE_SERVER_BUSY</state></root>"
         )
         info = network.parse_serverinfo(body)
         self.assertTrue(info["online"])
         self.assertTrue(info["busy"])
+        self.assertEqual(info["currentGame"], "881448767")
+        idle = network.parse_serverinfo("<root><currentgame>0</currentgame><state>SUNSHINE_SERVER_FREE</state></root>")
+        self.assertFalse(idle["busy"])
+        self.assertIsNone(idle["currentGame"])
         self.assertEqual(info["mac"], "aa:bb:cc:dd:ee:ff")
         self.assertEqual(info["version"], "7.1.431.-1")
 
@@ -479,6 +729,155 @@ class LaunchRequestTests(unittest.TestCase):
         pair = launch.build_argv(cmd, {"action": "pair", "host": "10.0.0.2", "pin": "0420"}, settings)
         self.assertEqual(pair[3:], ["pair", "10.0.0.2", "--pin", "0420"])
         self.assertEqual(launch.build_argv(cmd, {"action": "gui"}, settings), cmd)
+
+
+def make_tar(entries) -> bytes:
+    """gzip tar from (name, data | ("symlink", target) | None for a directory)."""
+    import io
+    import tarfile
+
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        for name, data in entries:
+            info = tarfile.TarInfo(name)
+            if data is None:
+                info.type = tarfile.DIRTYPE
+                tar.addfile(info)
+            elif isinstance(data, tuple):
+                info.type, info.linkname = tarfile.SYMTYPE, data[1]
+                tar.addfile(info)
+            else:
+                info.size, info.mode = len(data), 0o755 if name.endswith("bin/sunshine") else 0o644
+                tar.addfile(info, io.BytesIO(data))
+    return buffer.getvalue()
+
+
+def make_deb(data_tar: bytes) -> bytes:
+    out = b"!<arch>\n"
+    for name, data in (("debian-binary", b"2.0\n"), ("data.tar.gz", data_tar)):
+        out += f"{name + '/':<16}{0:<12}{0:<6}{0:<6}{'100644':<8}{len(data):<10}`\n".encode() + data
+        if len(data) % 2:
+            out += b"\n"
+    return out
+
+
+class NativeSunshineTests(unittest.TestCase):
+    def test_unpacks_only_what_sunshine_needs(self):
+        deb = make_deb(make_tar([
+            ("./usr/bin/sunshine", b"ELF /usr/share/sunshine/web"),
+            ("./usr/share/sunshine/", None),
+            ("./usr/share/sunshine/web/index.html", b"<html>"),
+            ("./usr/share/sunshine/../../../etc/evil", b"x"),
+            ("./usr/share/applications/sunshine.desktop", b"[Desktop Entry]"),
+        ]))
+        with tempfile.TemporaryDirectory() as tmp, sunshine_native.deb_data(deb) as tar:
+            sunshine_native.extract(tar, sunshine_native.sunshine_files(tar), tmp)
+            found = sorted(os.path.relpath(os.path.join(d, f), tmp) for d, _, files in os.walk(tmp) for f in files)
+            self.assertEqual(found, ["bin/sunshine", "web/index.html"])
+            self.assertTrue(os.access(os.path.join(tmp, "bin", "sunshine"), os.X_OK))
+
+    def test_libraries_keep_soname_links_but_not_outside_links(self):
+        tar_bytes = make_tar([
+            ("./usr/lib/x86_64-linux-gnu/libnuma.so.1.0.0", b"lib"),
+            ("./usr/lib/x86_64-linux-gnu/libnuma.so.1", ("symlink", "libnuma.so.1.0.0")),
+            ("./usr/lib/x86_64-linux-gnu/libevil.so", ("symlink", "/etc/shadow")),
+            ("./usr/share/doc/libnuma1/copyright", b"text"),
+        ])
+        with tempfile.TemporaryDirectory() as tmp, sunshine_native.deb_data(make_deb(tar_bytes)) as tar:
+            sunshine_native.extract(tar, sunshine_native.library_files(tar), tmp)
+            self.assertEqual(sorted(os.listdir(os.path.join(tmp, "lib"))), ["libnuma.so.1", "libnuma.so.1.0.0"])
+            self.assertEqual(os.readlink(os.path.join(tmp, "lib", "libnuma.so.1")), "libnuma.so.1.0.0")
+
+    def test_asset_prefix_keeps_binary_length(self):
+        data = b"\0/usr/share/sunshine\0/usr/share/sunshine/web\0"
+        patched, places = sunshine_native.patch_assets_prefix(data)
+        self.assertEqual((places, len(patched)), (2, len(data)))
+        self.assertIn(b"/home/.eclipse-sun//web", patched)
+
+    def test_picks_the_ubuntu_package_of_both_naming_schemes(self):
+        for name in ("sunshine-ubuntu-22.04-amd64.deb", "sunshine_2026.914.233613-1+ubuntu22.04_amd64.deb"):
+            release = {"tag_name": "v2026.914.233613", "assets": [
+                {"name": "sunshine-ubuntu-24.04-amd64.deb", "browser_download_url": "x"},
+                {"name": name, "browser_download_url": sunshine_native.DOWNLOAD_PREFIX + "v2026.914.233613/" + name},
+            ]}
+            self.assertEqual(sunshine_native.pick_deb_asset(release)["version"], "2026.914.233613")
+        foreign = {"tag_name": "v2026.914.233613", "assets": [
+            {"name": "sunshine-ubuntu-22.04-amd64.deb", "browser_download_url": "https://example.com/sunshine-ubuntu-22.04-amd64.deb"},
+        ]}
+        self.assertIsNone(sunshine_native.pick_deb_asset(foreign), "only GitHub downloads of that release")
+        with self.assertRaises(ValueError):
+            sunshine_native.release_api_url("v1; rm -rf /")
+
+    def test_config_drops_forced_composition_and_disables_tray(self):
+        text = "\n".join([
+            "min_log_level = info",
+            "system_tray = enabled",
+            'global_prep_cmd = [{"do":"sh -c \\"xprop GAMESCOPE_COMPOSITE_FORCE 1\\""},{"do":"echo hi"}]',
+        ])
+        out = sunshine_native.prepare_config(text)
+        self.assertIn("min_log_level = info", out)
+        self.assertIn('global_prep_cmd = [{"do":"echo hi"}]', out)
+        self.assertNotIn("GAMESCOPE_COMPOSITE_FORCE", out)
+        self.assertEqual(out.count("system_tray"), 1)
+        self.assertIn("system_tray = disabled", out)
+
+    def test_state_reports_outdated_helpers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, helpers = os.path.join(tmp, "root"), os.path.join(tmp, "helpers")
+            for path, data in (
+                ("root/bin/sunshine", b"bin"), ("root/bin/eclipse-sunshine", b"old"),
+                ("root/lib/libeclipse-sunshine.so", b"lib"), ("helpers/eclipse-sunshine", b"new"),
+                ("helpers/libeclipse-sunshine.so", b"lib"),
+            ):
+                os.makedirs(os.path.dirname(os.path.join(tmp, path)), exist_ok=True)
+                with open(os.path.join(tmp, path), "wb") as fh:
+                    fh.write(data)
+            with open(os.path.join(root, "eclipse.json"), "w") as fh:
+                json.dump({"version": "2026.914.233613"}, fh)
+            state = sunshine_native.state(helpers, root)
+            self.assertEqual((state["installed"], state["version"], state["helpersOutdated"]), (True, "2026.914.233613", True))
+            self.assertFalse(state["captureReady"], "no file capability in a temp dir")
+            self.assertFalse(sunshine_native.state(helpers, os.path.join(tmp, "missing"))["installed"])
+
+
+class SudoTests(unittest.TestCase):
+    def run_root(self, lines, rc):
+        async def fake_streaming(cmd, on_line, timeout=0, home=None, input=None):
+            self.assertEqual(cmd[:2], ["sudo", "-S"])
+            self.assertEqual(input, b"secret\n")
+            for line in lines:
+                on_line(line)
+            return rc
+
+        local = sunshine.LocalSunshine("/nonexistent", "/tmp", "/plugin")
+        seen = []
+        original = proc.run_streaming
+        proc.run_streaming = fake_streaming
+        try:
+            return asyncio.run(local._run_root(["uninstall"], "secret", seen.append)), seen
+        finally:
+            proc.run_streaming = original
+
+    def test_wrong_password(self):
+        result, seen = self.run_root(["Sorry, try again.", "sudo: 1 incorrect password attempt"], 1)
+        self.assertTrue(result["passwordRejected"])
+        self.assertIn("Wrong password", result["error"])
+        self.assertEqual(seen, [], "sudo's own output is not shown as progress")
+
+    def test_installer_error_is_reported(self):
+        result, seen = self.run_root([sunshine.ROOT_READY, "Downloading...", "ERROR: Checksum mismatch for x"], 1)
+        self.assertEqual(result["error"], "Checksum mismatch for x")
+        self.assertNotIn("passwordRejected", result)
+        self.assertEqual(seen[0], "Downloading...")
+
+    def test_success(self):
+        result, _ = self.run_root([sunshine.ROOT_READY, "Removed Sunshine for Gaming Mode"], 0)
+        self.assertTrue(result["ok"])
+
+    def test_empty_password_is_not_sent(self):
+        local = sunshine.LocalSunshine("/nonexistent", "/tmp", "/plugin")
+        result = asyncio.run(local._run_root(["uninstall"], "", lambda _: None))
+        self.assertFalse(result["ok"])
 
 
 if __name__ == "__main__":

@@ -50,7 +50,12 @@ const TOGGLES: { key: ToggleKey; label: string; description: string }[] = [
   { key: "vsync", label: "V-Sync", description: "Removes tearing, adds latency. Gamescope usually handles this." },
   { key: "performanceOverlay", label: "Performance overlay", description: "Show Moonlight's stream statistics." },
   { key: "gameOptimization", label: "Optimize game settings", description: "Let the host tune games for the stream." },
-  { key: "quitAppAfter", label: "Quit app after stream", description: "Close the app on the host when you exit." },
+  {
+    key: "quitAppAfter",
+    label: "End the host session too",
+    description:
+      "When the stream ends (End stream, Exit game or quitting Moonlight), close the app on the host so the session fully stops. Turn off to leave it open and resume later.",
+  },
   { key: "multiController", label: "Multiple controllers", description: "Forward every connected controller." },
   { key: "absoluteMouse", label: "Absolute mouse mode", description: "Better for remote desktop use with touch." },
   { key: "muteOnFocusLoss", label: "Mute when unfocused", description: "Silence the stream when Moonlight loses focus." },

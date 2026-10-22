@@ -40,36 +40,54 @@ from .sunshine import SunshineApi, describe_status
 
 _META_KEYS = ("status", "platform", "version")
 _KMS_MONITOR_RE = re.compile(r"Monitor (\d+) is ([A-Za-z0-9_-]+): ?(.*)$")
+_KMS_START = "Start of KMS monitor list"
 _WINDOWS_MARKER = "Currently available display devices:"
+# Sunshine log lines start with "[2026-10-01 10:00:00.000]: Info: ...".
+_LOG_TIME_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
 _MAX_LOG_BYTES = 8 * 1024 * 1024
 
 
 # ---------------------------------------------------------------- detection
 
 
-def _parse_kms(log_text: str) -> list[dict[str, str]]:
+def _line_time(log_text: str, position: int) -> Optional[str]:
+    """Timestamp of the log line containing ``position``."""
+    line_start = log_text.rfind("\n", 0, position) + 1
+    match = _LOG_TIME_RE.match(log_text[line_start:line_start + 40])
+    return match.group(1) if match else None
+
+
+def _parse_kms(log_text: str) -> tuple[list[dict[str, str]], Optional[str]]:
+    """Monitors from the LAST KMS enumeration only.
+
+    Sunshine enumerates monitors again on later starts/sessions; older lists
+    may name monitors that are gone, so they must not be merged in.
+    """
+    start = log_text.rfind(_KMS_START)
+    block = log_text[start:] if start >= 0 else log_text
     displays: dict[str, dict[str, str]] = {}
-    for line in log_text.splitlines():
+    for line in block.splitlines():
+        if start >= 0 and "End of KMS monitor list" in line:
+            break
         match = _KMS_MONITOR_RE.search(line)
         if match:
-            index, connector, description = match.groups()
+            _, connector, description = match.groups()
             label = f"{connector} ({description.strip()})" if description.strip() else connector
-            # Later log entries (latest startup) win.
-            displays[connector] = {"outputName": connector, "label": label, "index": index}
-    return [{"outputName": d["outputName"], "label": d["label"]} for d in displays.values()]
+            displays[connector] = {"outputName": connector, "label": label}
+    return list(displays.values()), (_line_time(log_text, start) if start >= 0 else None)
 
 
-def _parse_windows(log_text: str) -> list[dict[str, str]]:
+def _parse_windows(log_text: str) -> tuple[list[dict[str, str]], Optional[str]]:
     position = log_text.rfind(_WINDOWS_MARKER)
     if position < 0:
-        return []
+        return [], None
     start = log_text.find("[", position)
     if start < 0:
-        return []
+        return [], None
     try:
         devices, _ = json.JSONDecoder().raw_decode(log_text[start:])
     except ValueError:
-        return []
+        return [], None
     displays: list[dict[str, str]] = []
     for device in devices if isinstance(devices, list) else []:
         if not isinstance(device, dict) or not device.get("device_id"):
@@ -78,24 +96,54 @@ def _parse_windows(log_text: str) -> list[dict[str, str]]:
         display_name = device.get("display_name")
         label = f"{name} ({display_name})" if display_name and display_name != name else str(name)
         displays.append({"outputName": str(device["device_id"]), "label": label})
-    return displays
+    return displays, _line_time(log_text, position)
+
+
+def parse_displays_with_time(log_text: str) -> tuple[list[dict[str, str]], Optional[str]]:
+    """Displays from the most recent enumeration in a Sunshine log, and when it happened."""
+    windows = _parse_windows(log_text)
+    return windows if windows[0] else _parse_kms(log_text)
 
 
 def parse_displays(log_text: str) -> list[dict[str, str]]:
     """Extract the host's displays from a Sunshine log, best effort."""
-    return _parse_windows(log_text) or _parse_kms(log_text)
+    return parse_displays_with_time(log_text)[0]
 
 
 def detect_displays(api: SunshineApi) -> dict[str, Any]:
+    """Read the monitor list Sunshine logged most recently.
+
+    The list is only as fresh as Sunshine's last enumeration; see
+    :func:`rescan_displays` to force a new one.
+    """
     status, text = api.request_sync("GET", "/api/logs", None, 10.0, _MAX_LOG_BYTES, True)
     if status != 200 or not isinstance(text, str):
-        return {"ok": False, "displays": [], "error": describe_status(status)}
-    displays = parse_displays(text)
-    error = None if displays else "No display list found in the Sunshine log. Add the display manually."
-    return {"ok": bool(displays), "displays": displays, "error": error}
+        return {"ok": False, "displays": [], "detectedAt": None, "error": describe_status(status)}
+    displays, detected_at = parse_displays_with_time(text)
+    error = None if displays else "No monitor list found in the Sunshine log. Try Rescan, or add one manually."
+    return {"ok": bool(displays), "displays": displays, "detectedAt": detected_at, "error": error}
+
+
+def rescan_displays(api: SunshineApi, addresses: list[dict[str, Any]]) -> dict[str, Any]:
+    """Restart Sunshine so it enumerates monitors again, then read the new list."""
+    if any((network.probe_sync(a["address"], int(a["port"]), 1.5) or {}).get("busy") for a in addresses):
+        return {"ok": False, "displays": [], "detectedAt": None,
+                "error": "An app is still open on the host. Quit it first, then rescan."}
+    api.request_sync("POST", "/api/restart", {}, 3.0)
+    if not _wait_restart(addresses):
+        return {"ok": False, "displays": [], "detectedAt": None, "error": "Sunshine did not come back after restarting"}
+    return detect_displays(api)
 
 
 # ---------------------------------------------------------------- switching
+
+
+def current_output(api: SunshineApi) -> dict[str, Any]:
+    """The display Sunshine is set to capture. Empty means its default (main) display."""
+    config, error = read_config(api)
+    if config is None:
+        return {"ok": False, "current": None, "error": error}
+    return {"ok": True, "current": str(config.get("output_name") or ""), "error": None}
 
 
 def read_config(api: SunshineApi) -> tuple[Optional[dict[str, Any]], Optional[str]]:
@@ -156,9 +204,14 @@ def switch_display(
     if current == output_name:
         return {"ok": True, "changed": False, "error": None}
 
-    # Restarting Sunshine would end a session someone else is running.
+    # Restarting Sunshine would close the app that is open on the host (and any
+    # stream attached to it), so only switch when no app is running.
     if any((network.probe_sync(a["address"], int(a["port"]), 1.5) or {}).get("busy") for a in addresses):
-        return {"ok": False, "changed": False, "error": "The host is busy with another stream, cannot switch displays now"}
+        return {
+            "ok": False,
+            "changed": False,
+            "error": "An app is still open on the host. Quit it first, then switch displays.",
+        }
 
     _backup(config, backup_path)
     updated = dict(config)
@@ -198,5 +251,15 @@ def apply_host_selection(settings: dict[str, Any], host: dict[str, Any], backup_
     if not online:
         return {"ok": False, "changed": False, "error": f"{host['name']} is offline"}
     api = SunshineApi(online["address"], cfg["sunshineUser"], cfg["sunshinePassword"], int(cfg.get("sunshinePort") or 0))
+
+    # Monitors come and go; never point Sunshine at one that is gone. If the
+    # log cannot be read, trust the selection rather than blocking the stream.
+    found = detect_displays(api)
+    if found["ok"] and str(target) not in {d["outputName"] for d in found["displays"]}:
+        known = (cfg.get("displays") or [])
+        name = next((d.get("label") for d in known if d.get("outputName") == target), target)
+        return {"ok": False, "changed": False, "missing": True,
+                "error": f"Monitor '{name}' is not connected to {host['name']} any more. Choose another monitor."}
+
     backup_path = os.path.join(backup_dir, f"sunshine-config-backup-{host['uuid']}.json")
     return switch_display(api, str(target), [online], backup_path)

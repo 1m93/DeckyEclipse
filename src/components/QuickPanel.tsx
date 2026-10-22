@@ -13,7 +13,7 @@ import {
   updateStream,
   useStore,
 } from "../lib/store";
-import { useSunshineStatus } from "../lib/sunshine";
+import { describeSunshine, useSunshineStatus } from "../lib/sunshine";
 import { showAddHostModal } from "./AddHostModal";
 import { FeatureSetup, InstallSection } from "./FeatureSetup";
 import { HostRow } from "./HostRow";
@@ -21,6 +21,8 @@ import { showSunshinePinModal } from "./SunshinePinModal";
 
 function NowStreaming() {
   const session = useStore((s) => s.session);
+  // Hosts pinned to a preset still use the global behavior options.
+  const quitAfter = useStore((s) => s.settings?.stream.quitAppAfter ?? true);
   const host = useStore((s) => (session ? s.hosts.find((h) => h.uuid === session.hostUuid) : undefined));
   const [elapsed, setElapsed] = useState(0);
 
@@ -34,6 +36,7 @@ function NowStreaming() {
 
   if (!session) return null;
   const minutes = Math.floor(elapsed / 60);
+  const quitsHostApp = Boolean(session.hostUuid) && quitAfter;
   const title = session.hostName ? `${session.appName} on ${session.hostName}` : session.appName;
 
   return (
@@ -43,11 +46,14 @@ function NowStreaming() {
           label={title}
           description={session.confirmed ? `${minutes} min` : "Starting..."}
           bottomSeparator="none"
-          padding="compact"
         />
       </PanelSectionRow>
       <PanelSectionRow>
-        <ButtonItem layout="below" onClick={() => void endStream()}>
+        <ButtonItem
+          layout="below"
+          description={quitsHostApp ? "Also closes the app on the host." : "The app stays open on the host."}
+          onClick={() => void endStream()}
+        >
           End stream
         </ButtonItem>
       </PanelSectionRow>
@@ -149,7 +155,7 @@ function QuickStreamSettings() {
 }
 
 function LocalSunshine({ visible }: { visible: boolean }) {
-  const { status, busy, setRunning } = useSunshineStatus(visible);
+  const { status, pending, busy, setRunning } = useSunshineStatus(visible);
 
   if (!status) return null;
   if (!status.installed) return <InstallSection feature="sunshine" />;
@@ -159,25 +165,19 @@ function LocalSunshine({ visible }: { visible: boolean }) {
       <PanelSectionRow>
         <ToggleField
           label="Sunshine server"
-          description={
-            status.running
-              ? "Running · other devices can stream from here"
-              : status.autostart
-                ? "Stopped · starts automatically with the plugin"
-                : "Stopped · start it when you want to share"
-          }
+          description={describeSunshine(status, pending)}
           checked={status.running}
           disabled={busy}
           onChange={(checked) => void setRunning(checked)}
         />
       </PanelSectionRow>
-      {status.running && (
+      {status.running && !busy && (
         <PanelSectionRow>
           <ButtonItem
             layout="below"
             onClick={() => (status.credentials ? showSunshinePinModal() : openEclipsePage("sunshine"))}
           >
-            {status.credentials ? "Enter client PIN" : "Set up credentials"}
+            {status.credentials ? "Pair a device" : "Set up Sunshine login"}
           </ButtonItem>
         </PanelSectionRow>
       )}

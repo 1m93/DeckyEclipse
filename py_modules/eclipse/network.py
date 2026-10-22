@@ -58,13 +58,22 @@ def _serverinfo_request(host: str) -> bytes:
 
 
 def parse_serverinfo(body: str) -> dict[str, Any]:
+    """Parse ``/serverinfo``.
+
+    In Sunshine, ``state``/``currentgame`` only say whether an app process is
+    running on the host (``proc::proc.running()``), not whether a client is
+    streaming. An app keeps running after a client disconnects without
+    quitting it, so ``busy`` means "an app is open and can be resumed".
+    """
     tags = {key.lower(): value.strip() for key, value in _TAG_RE.findall(body)}
     state = tags.get("state", "")
     current_game = tags.get("currentgame", "0")
-    busy = state.endswith("_BUSY") or (current_game not in ("", "0"))
+    running = current_game not in ("", "0")
+    busy = state.endswith("_BUSY") or running
     return {
         "online": True,
         "busy": busy,
+        "currentGame": current_game if running else None,
         "hostname": tags.get("hostname"),
         "uniqueId": tags.get("uniqueid"),
         "version": tags.get("appversion"),

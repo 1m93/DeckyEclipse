@@ -69,6 +69,25 @@ def _ssl_context() -> ssl.SSLContext:
     return context
 
 
+def fetch_json(url: str, timeout: float = 10.0) -> Any:
+    """GET a GitHub API URL (blocking).
+
+    Raises urllib.error.HTTPError, urllib.error.URLError, OSError or ValueError.
+    """
+    request = urllib.request.Request(url, headers={
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "DeckyEclipse",
+    })
+    with urllib.request.urlopen(request, timeout=timeout, context=_ssl_context()) as res:
+        return json.loads(res.read(4 * 1024 * 1024).decode())
+
+
+def describe_error(exc: Exception) -> str:
+    if isinstance(exc, urllib.error.HTTPError):
+        return f"GitHub returned HTTP {exc.code}"
+    return f"Could not reach GitHub: {getattr(exc, 'reason', exc)}"
+
+
 def check(plugin_dir: str, timeout: float = 10.0) -> dict[str, Any]:
     """Blocking check against the latest GitHub release."""
     package = read_package(plugin_dir)
@@ -83,18 +102,13 @@ def check(plugin_dir: str, timeout: float = 10.0) -> dict[str, Any]:
         return result
 
     url = f"https://api.github.com/repos/{repo[0]}/{repo[1]}/releases/latest"
-    request = urllib.request.Request(url, headers={
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "DeckyEclipse",
-    })
     try:
-        with urllib.request.urlopen(request, timeout=timeout, context=_ssl_context()) as res:
-            release = json.loads(res.read(1024 * 1024).decode())
+        release = fetch_json(url, timeout)
     except urllib.error.HTTPError as exc:
-        result["error"] = "No release published yet" if exc.code == 404 else f"GitHub returned HTTP {exc.code}"
+        result["error"] = "No release published yet" if exc.code == 404 else describe_error(exc)
         return result
     except (urllib.error.URLError, OSError, ValueError) as exc:
-        result["error"] = f"Could not reach GitHub: {getattr(exc, 'reason', exc)}"
+        result["error"] = describe_error(exc)
         return result
 
     latest = str(release.get("tag_name") or "").strip()

@@ -25,7 +25,8 @@ STREAM_DEFAULTS: dict[str, Any] = {
     "framePacing": True,
     "performanceOverlay": False,
     "gameOptimization": True,
-    "quitAppAfter": False,
+    # End the session on the host (close the app) when the stream ends.
+    "quitAppAfter": True,
     "multiController": True,
     "absoluteMouse": False,
     "muteOnFocusLoss": False,

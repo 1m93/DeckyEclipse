@@ -179,12 +179,15 @@ def hosts_from_sections(sections: dict[str, dict[str, Any]]) -> list[dict[str, A
                 "hidden": _as_bool(get(app_prefix + "hidden")),
             })
 
+        server_cert = get("srvcert")
         hosts.append({
             "uuid": uuid,
             "name": name,
             "addresses": addresses,
             "mac": _format_mac(get("mac")),
             "apps": apps,
+            # Moonlight stores the host certificate only once pairing succeeded.
+            "paired": bool(server_cert) and len(server_cert) > 32,
         })
     return hosts
 

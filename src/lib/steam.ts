@@ -1,5 +1,6 @@
 import { backend } from "../backend";
-import { getState, setState, updateSettings, flushSettings } from "./store";
+import type { StreamSession } from "../types";
+import { getState, refreshAfterStream, setState, updateSettings, flushSettings } from "./store";
 
 const LAUNCHER_NAME = "Moonlight (Eclipse)";
 /** ELaunchSource._2ftLibraryDetails, the same source the library "Play" button uses. */
@@ -149,6 +150,22 @@ function describeShortcut(appId: number): { hostUuid: string; hostName: string; 
   return null;
 }
 
+let streamEndedHandler: (session: StreamSession) => void = () => refreshAfterStream();
+let internalLaunches = 0;
+
+/** Called once per stream when it ends, however it ended. */
+export function setStreamEndedHandler(handler: (session: StreamSession) => void): void {
+  streamEndedHandler = handler;
+}
+
+/**
+ * The next launcher start is plugin housekeeping (e.g. `moonlight quit`),
+ * not a stream, so it must not show up as a session.
+ */
+export function markInternalLaunch(): void {
+  internalLaunches += 1;
+}
+
 /** Keep the stream session in sync with Steam's app lifetime notifications. */
 export function registerLifetimeTracking(): () => void {
   const registration = window.SteamClient.GameSessions.RegisterForAppLifetimeNotifications((n) => {
@@ -163,6 +180,8 @@ export function registerLifetimeTracking(): () => void {
       const library = describeShortcut(n.unAppID);
       if (library) {
         setState({ session: { appId: n.unAppID, ...library, startedAt: Date.now(), confirmed: true } });
+      } else if (isLauncher && !session && internalLaunches > 0) {
+        internalLaunches -= 1;
       } else if (isLauncher && !session) {
         // Launched from the library without a pending request: plain Moonlight UI.
         setState({
@@ -171,6 +190,7 @@ export function registerLifetimeTracking(): () => void {
       }
     } else if (session && session.appId === n.unAppID) {
       setState({ session: null });
+      streamEndedHandler(session);
     }
   });
   return () => registration.unregister();

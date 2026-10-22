@@ -18,18 +18,21 @@ sys.path.insert(0, os.path.join(decky.DECKY_PLUGIN_DIR, "py_modules"))
 
 from eclipse import LAUNCHER_LOG, SETTINGS_FILE  # noqa: E402
 from eclipse import FLATPAK_MOONLIGHT, FLATPAK_SUNSHINE  # noqa: E402
-from eclipse import display, flatpak, host_display, launch, moonlight, network, updates  # noqa: E402
+from eclipse import diagnostics, display, flatpak, host_display, launch, moonlight, network, updates  # noqa: E402
+from eclipse import sunshine_native  # noqa: E402
 from eclipse.log import set_logger  # noqa: E402
 from eclipse.moonlight_config import MoonlightConfig, find_boxart  # noqa: E402
-from eclipse.presets import AUTO_PRESET, CUSTOM_PRESET, INHERIT_PRESET, all_presets  # noqa: E402
+from eclipse.presets import AUTO_PRESET, CUSTOM_PRESET, INHERIT_PRESET, all_presets, effective_stream  # noqa: E402
 from eclipse.settings import SettingsStore  # noqa: E402
-from eclipse.sunshine import LocalSunshine, SunshineApi  # noqa: E402
+from eclipse.sunshine import LocalSunshine, SunshineApi, pair_client  # noqa: E402
 
 set_logger(decky.logger)
 log = decky.logger
 
 FLATPAK_IDS = {"moonlight": FLATPAK_MOONLIGHT, "sunshine": FLATPAK_SUNSHINE}
 PROBE_CACHE_S = 3.0
+# Minimum time between install progress events sent to the frontend.
+PROGRESS_INTERVAL_S = 0.5
 LOG_TAIL_LINES = 200
 # Block elements flatpak uses to draw progress bars.
 _BAR_CHARS = re.compile(r"[\u2580-\u259f]+")
@@ -58,6 +61,8 @@ class Plugin:
     _operation: Optional[str]
     _install_task: Optional[asyncio.Future]
     _cancel_requested: bool
+    # False while a step runs as root (sudo): it cannot be stopped from here.
+    _cancellable: bool
     _pending_creds: dict[str, dict[str, Any]]
     _tasks: set[asyncio.Task]
 
@@ -67,7 +72,7 @@ class Plugin:
         home = decky.DECKY_USER_HOME
         self.settings = SettingsStore(os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, SETTINGS_FILE))
         self.config = MoonlightConfig(home)
-        self.local_sunshine = LocalSunshine(home, decky.DECKY_PLUGIN_LOG_DIR)
+        self.local_sunshine = LocalSunshine(home, decky.DECKY_PLUGIN_LOG_DIR, decky.DECKY_PLUGIN_DIR)
         self._probe_cache = {}
         self._probe_at = float("-inf")
         self._probe_lock = asyncio.Lock()
@@ -77,6 +82,7 @@ class Plugin:
         self._operation = None
         self._install_task = None
         self._cancel_requested = False
+        self._cancellable = True
         self._pending_creds = {}
         self._tasks = set()
         log.info("Eclipse backend started (home=%s)", home)
@@ -286,7 +292,7 @@ class Plugin:
                 host_display.apply_host_selection, self.settings.data, host, decky.DECKY_PLUGIN_SETTINGS_DIR
             )
             if not switched["ok"]:
-                return {"ok": False, "error": switched["error"]}
+                return {"ok": False, "error": switched["error"], "monitorMissing": bool(switched.get("missing"))}
 
         launch.write_request(decky.DECKY_PLUGIN_SETTINGS_DIR, {
             "action": "stream",
@@ -335,15 +341,25 @@ class Plugin:
 
     async def _auto_submit_pin(self, api: SunshineApi, pin: str) -> None:
         name = self.settings.data["sunshine"].get("deviceName") or "Steam Deck"
-        # Moonlight needs a moment to start and initiate pairing; retry until it does.
+        # Moonlight needs a moment to start and ask the host to pair; retry until
+        # the request shows up (pair_client reports "no device is waiting" until then).
         await asyncio.sleep(3)
-        result: dict[str, Any] = {"ok": False, "error": "Timed out"}
+        result: dict[str, Any] = {"ok": False, "error": "Timed out waiting for Moonlight to start pairing"}
         for _ in range(10):
-            result = await api.submit_pin(pin, name)
-            if result["ok"] or result["status"] == 401:
+            result = await pair_client(api, pin, name)
+            if result["ok"] or "waiting" not in (result.get("error") or ""):
                 break
             await asyncio.sleep(2)
         await self._emit("eclipse_pair_result", result["ok"], result.get("error"))
+
+    async def pairing_outcome(self, address: str) -> dict[str, Any]:
+        """After Moonlight's pairing window closed: did pairing with ``address`` succeed?"""
+        wanted = network.split_address(address)[0].lower()
+        for host in self._hosts():
+            names = {host["name"].lower()} | {network.split_address(a["address"])[0].lower() for a in host["addresses"]}
+            if wanted in names:
+                return {"paired": bool(host.get("paired")), "host": host["name"]}
+        return {"paired": False, "host": None}
 
     async def prepare_quit(self, uuid: str) -> dict[str, Any]:
         """Quit the running app on a host, via the Sunshine API when possible."""
@@ -359,6 +375,28 @@ class Plugin:
         launch.write_request(decky.DECKY_PLUGIN_SETTINGS_DIR, {"action": "quit", "host": host["name"]})
         return {"ok": True, "launch": True, "error": None}
 
+    async def quit_after_stream(self, uuid: str) -> dict[str, Any]:
+        """Make sure the host session ends after a stream, when the user wants that.
+
+        Moonlight's ``--quit-after`` covers a normal exit, but when Steam kills
+        Moonlight (End stream, Exit game) the app can stay open on the host.
+        Give Moonlight a few seconds first, then close whatever is still open.
+        """
+        host = self._find_host(uuid)
+        if not host:
+            return {"ok": False, "launch": False, "error": "Unknown host"}
+        stream = await asyncio.to_thread(effective_stream, self.settings.data, uuid)
+        if not stream.get("quitAppAfter"):
+            return {"ok": True, "launch": False, "error": None}
+
+        for _ in range(3):
+            await asyncio.sleep(2)
+            status = await network.probe_any(host["addresses"])
+            if not status or not status.get("busy"):
+                return {"ok": True, "launch": False, "error": None}
+        log.info("An app is still open on %s after the stream, quitting it", host["name"])
+        return await self.prepare_quit(uuid)
+
     async def stop_stream(self) -> None:
         await moonlight.kill_running(decky.DECKY_USER_HOME)
 
@@ -369,6 +407,57 @@ class Plugin:
         if not api:
             return {"ok": False, "displays": [], "error": "Set the host's Sunshine credentials first"}
         return await asyncio.to_thread(host_display.detect_displays, api)
+
+    async def refresh_host_monitors(self, uuid: str, rescan: bool = False) -> dict[str, Any]:
+        """Re-read the host's monitors and replace the saved list with them.
+
+        Names the user gave and manually added monitors are kept. Monitors
+        that are gone are dropped, and so is a selection pointing at one.
+        ``rescan`` restarts Sunshine first so it enumerates monitors again.
+        """
+        host = self._find_host(uuid)
+        api = self._sunshine_api_for(host) if host else None
+        if not host or not api:
+            return {"ok": False, "error": "Set the host's Sunshine login first", "settings": self.settings.public()}
+
+        if rescan:
+            found = await asyncio.to_thread(host_display.rescan_displays, api, host["addresses"])
+        else:
+            found = await asyncio.to_thread(host_display.detect_displays, api)
+        current = await asyncio.to_thread(host_display.current_output, api)
+        if not found["ok"]:
+            return {**found, "current": current.get("current"), "settings": self.settings.public()}
+
+        cfg = self._host_cfg(uuid)
+        saved = {d["outputName"]: d for d in cfg.get("displays") or []}
+        detected = [
+            {**d, "label": saved[d["outputName"]]["label"]} if d["outputName"] in saved else d
+            for d in found["displays"]
+        ]
+        names = {d["outputName"] for d in detected}
+        manual = [d for d in saved.values() if d.get("manual") and d["outputName"] not in names]
+        selection_lost = bool(cfg.get("display")) and cfg["display"] not in names | {d["outputName"] for d in manual}
+
+        patch: dict[str, Any] = {"displays": detected + manual}
+        if selection_lost:
+            patch["display"] = None
+        self.settings.update({"hosts": {uuid: patch}})
+        return {
+            "ok": True,
+            "error": None,
+            "detectedAt": found.get("detectedAt"),
+            "current": current.get("current"),
+            "selectionLost": selection_lost,
+            "settings": self.settings.public(),
+        }
+
+    async def host_current_display(self, uuid: str) -> dict[str, Any]:
+        """Which display the host's Sunshine captures right now (needs credentials)."""
+        host = self._find_host(uuid)
+        api = self._sunshine_api_for(host) if host else None
+        if not api:
+            return {"ok": False, "current": None, "error": "Set the host's Sunshine credentials first"}
+        return await asyncio.to_thread(host_display.current_output, api)
 
     async def test_host_credentials(self, uuid: str) -> dict[str, Any]:
         host = self._find_host(uuid)
@@ -421,7 +510,7 @@ class Plugin:
 
     # ------------------------------------------------------------------ install
 
-    async def _install(self, target: str, job: Any, operation: str = "install") -> dict[str, Any]:
+    async def _install(self, target: str, job: Any, operation: str = "install", cancellable: bool = True) -> dict[str, Any]:
         """Run an install/update/uninstall job with throttled progress events.
 
         One operation runs at a time; it is cancellable via :meth:`cancel_install`.
@@ -431,20 +520,41 @@ class Plugin:
         self._installing = target
         self._operation = operation
         self._cancel_requested = False
+        self._cancellable = cancellable
         loop = asyncio.get_running_loop()
         last_emit = float("-inf")  # monotonic() has an arbitrary origin
+        # Newest line not sent yet because of the throttle, and the timer that sends it.
+        pending: Optional[str] = None
+        flush_timer: Optional[asyncio.TimerHandle] = None
+
+        def emit(line: str) -> None:
+            nonlocal last_emit
+            last_emit = time.monotonic()
+            loop.create_task(self._emit("eclipse_install_progress", target, line[:160]))
+
+        def flush() -> None:
+            nonlocal pending, flush_timer
+            flush_timer = None
+            if pending is not None:
+                emit(pending)
+                pending = None
 
         def on_line(line: str) -> None:
-            nonlocal last_emit
+            nonlocal pending, flush_timer
             line = _clean_progress(line)
             if not line:
                 return
             log.info("[%s %s] %s", operation, target, line)
             # Throttle progress events, flatpak can print many lines per second.
-            now = time.monotonic()
-            if now - last_emit > 0.5:
-                last_emit = now
-                loop.create_task(self._emit("eclipse_install_progress", target, line[:160]))
+            # A throttled line is sent later, so the UI always ends on the newest one.
+            wait = PROGRESS_INTERVAL_S - (time.monotonic() - last_emit)
+            if wait <= 0:
+                pending = None
+                emit(line)
+            else:
+                pending = line
+                if flush_timer is None:
+                    flush_timer = loop.call_later(wait, flush)
 
         self._install_task = asyncio.ensure_future(job(on_line))
         try:
@@ -458,6 +568,9 @@ class Plugin:
             self._installing = None
             self._operation = None
             self._install_task = None
+            # The final status below must not be overtaken by a delayed line.
+            if flush_timer is not None:
+                flush_timer.cancel()
         if target == "moonlight":
             await self._resolve_moonlight(force=True)
         else:
@@ -470,6 +583,8 @@ class Plugin:
         """Stop the running installation (kills the flatpak process group)."""
         if not self._install_task:
             return {"ok": False, "error": "No installation is running"}
+        if not self._cancellable:
+            return {"ok": False, "error": "Sunshine for Gaming Mode is installed as root; this step cannot be cancelled"}
         self._cancel_requested = True
         self._install_task.cancel()
         return {"ok": True, "error": None}
@@ -482,15 +597,38 @@ class Plugin:
 
         return await self._install("moonlight", job)
 
-    async def install_sunshine(self) -> dict[str, Any]:
+    async def _install_native_sunshine(self, password: str, operation: str, repair: bool = False) -> dict[str, Any]:
+        """Install, update or repair Sunshine for Gaming Mode (needs the sudo password)."""
+
         async def job(on_line: Any) -> dict[str, Any]:
-            result = await self.local_sunshine.install(on_line)
+            if repair:
+                result = await self.local_sunshine.repair(password, on_line)
+            else:
+                result = await self.local_sunshine.install(password, on_line)
             if result["ok"]:
-                # The setup script may enable the service; honor the user's choice.
+                # The service is only enabled when the user turned on autostart.
                 await self.local_sunshine.apply_autostart(bool(self.settings.data["sunshine"].get("autostart")))
             return result
 
-        return await self._install("sunshine", job)
+        return await self._install("sunshine", job, operation, cancellable=False)
+
+    async def install_sunshine(self, password: str) -> dict[str, Any]:
+        return await self._install_native_sunshine(password, "install")
+
+    async def repair_sunshine(self, password: str) -> dict[str, Any]:
+        """Reinstall the installed Sunshine version (capability lost, or helpers updated with the plugin)."""
+        return await self._install_native_sunshine(password, "install", repair=True)
+
+    async def uninstall_sunshine_flatpak(self, delete_data: bool) -> dict[str, Any]:
+        """Remove a Flatpak Sunshine left next to Sunshine for Gaming Mode."""
+        info = await self._app_info("sunshine")
+        if not info:
+            return {"ok": False, "error": "The Sunshine Flatpak is not installed", "warning": None}
+
+        async def job(on_line: Any) -> dict[str, Any]:
+            return await self.local_sunshine.uninstall_flatpak(info["installation"], on_line, bool(delete_data))
+
+        return await self._install("sunshine", job, "uninstall")
 
     # ------------------------------------------------------------------ app management
 
@@ -507,26 +645,49 @@ class Plugin:
         moonlight_info, sunshine_info = await asyncio.gather(self._app_info("moonlight"), self._app_info("sunshine"))
         resolved = await self._resolve_moonlight()
         sunshine_detected = await self.local_sunshine.detect()
+        native_state = self.local_sunshine.native_state()
 
         def entry(info: Optional[dict[str, Any]], installed_elsewhere: bool) -> dict[str, Any]:
             if info:
                 return {"installed": True, "managed": True, **info}
             return {"installed": installed_elsewhere, "managed": False, "version": None, "installation": None}
 
+        if native_state["installed"]:
+            sunshine_entry = {
+                "installed": True, "managed": True, "version": native_state["version"],
+                "installation": "eclipse", "alsoFlatpak": sunshine_info is not None,
+            }
+        else:
+            sunshine_entry = entry(sunshine_info, sunshine_detected["installed"])
         return {
             "moonlight": entry(moonlight_info, resolved["installed"] and resolved["source"] != "flatpak"),
-            "sunshine": entry(sunshine_info, sunshine_detected["installed"]),
+            "sunshine": sunshine_entry,
             "operation": self._operation,
             "busy": self._installing,
         }
 
     async def check_app_update(self, feature: str) -> dict[str, Any]:
+        if feature == "sunshine" and self.local_sunshine.native_state()["installed"]:
+            return await self._check_native_sunshine_update()
         info = await self._app_info(feature)
         if not info:
             return {"ok": False, "available": False, "version": None, "error": "Not installed as a Flatpak"}
         return await flatpak.check_update(FLATPAK_IDS[feature], info["installation"], decky.DECKY_USER_HOME)
 
-    async def update_app(self, feature: str) -> dict[str, Any]:
+    async def _check_native_sunshine_update(self) -> dict[str, Any]:
+        current = self.local_sunshine.native_state()["version"] or "0"
+        try:
+            release = await asyncio.to_thread(updates.fetch_json, sunshine_native.release_api_url(None))
+        except (OSError, ValueError) as exc:
+            return {"ok": False, "available": False, "version": None, "error": updates.describe_error(exc)}
+        asset = sunshine_native.pick_deb_asset(release if isinstance(release, dict) else {})
+        if not asset:
+            return {"ok": False, "available": False, "version": None, "error": "The latest Sunshine release has no Ubuntu 22.04 build"}
+        return {"ok": True, "available": updates.is_newer(asset["version"], current), "version": asset["version"], "error": None}
+
+    async def update_app(self, feature: str, password: Optional[str] = None) -> dict[str, Any]:
+        if feature == "sunshine" and self.local_sunshine.native_state()["installed"]:
+            return await self._install_native_sunshine(password or "", "update")
         info = await self._app_info(feature)
         if not info:
             return {"ok": False, "error": "Not installed as a Flatpak", "warning": None}
@@ -541,14 +702,20 @@ class Plugin:
 
         return await self._install(feature, job, "update")
 
-    async def uninstall_app(self, feature: str, delete_data: bool) -> dict[str, Any]:
+    async def uninstall_app(self, feature: str, delete_data: bool, password: Optional[str] = None) -> dict[str, Any]:
+        if feature == "sunshine" and self.local_sunshine.native_state()["installed"]:
+
+            async def native_job(on_line: Any) -> dict[str, Any]:
+                return await self.local_sunshine.uninstall(password or "", on_line, bool(delete_data))
+
+            return await self._install("sunshine", native_job, "uninstall", cancellable=False)
         info = await self._app_info(feature)
         if not info:
             return {"ok": False, "error": "Not installed as a Flatpak", "warning": None}
 
         async def job(on_line: Any) -> dict[str, Any]:
             if feature == "sunshine":
-                return await self.local_sunshine.uninstall(info["installation"], on_line, bool(delete_data))
+                return await self.local_sunshine.uninstall_flatpak(info["installation"], on_line, bool(delete_data))
             await moonlight.kill_running(decky.DECKY_USER_HOME)
             ok = await flatpak.uninstall(FLATPAK_MOONLIGHT, info["installation"], on_line, bool(delete_data), decky.DECKY_USER_HOME)
             return {"ok": ok, "error": None if ok else "Uninstall failed, see the plugin log", "warning": None}
@@ -595,14 +762,81 @@ class Plugin:
         self.settings.update({"sunshine": {"autostart": bool(enabled)}})
         return await self.local_sunshine.apply_autostart(bool(enabled))
 
-    async def sunshine_submit_pin(self, pin: str, client_name: str) -> dict[str, Any]:
+    async def sunshine_diagnostics(self) -> dict[str, Any]:
+        """Checks explaining why other devices cannot find or reach Sunshine here."""
+        status = await self.local_sunshine.status()
+        return await diagnostics.run(status, decky.DECKY_USER_HOME)
+
+    async def get_sunshine_log(self) -> str:
+        """Tail of Sunshine's own log, falling back to the output of a plugin-started Sunshine."""
+        path = diagnostics.sunshine_log_path(decky.DECKY_USER_HOME) or self.local_sunshine.log_path
+        return await asyncio.to_thread(_tail, path, LOG_TAIL_LINES)
+
+    async def sunshine_login_state(self) -> dict[str, Any]:
+        """State of the web UI login of Sunshine on this device.
+
+        ``state``: "ok" (saved login works), "needs_setup" (Sunshine has no
+        login yet), "invalid" (saved login rejected), "missing" (Sunshine has a
+        login but none is saved here) or "unreachable" (Sunshine not running).
+        """
+        cfg = self.settings.data["sunshine"]
+        api = SunshineApi("127.0.0.1", cfg.get("user") or "", cfg.get("password") or "", int(cfg.get("port") or 0))
+        result = await api.test()
+        if result["ok"]:
+            state = "ok"
+        elif result["needsSetup"]:
+            state = "needs_setup"
+        elif result["status"] == 401:
+            state = "invalid" if self._local_api() else "missing"
+        else:
+            state = "unreachable"
+        return {"state": state, "error": result["error"]}
+
+    async def sunshine_create_login(self, user: str, password: str) -> dict[str, Any]:
+        """Create the first login of Sunshine on this device and save it here."""
+        user, password = (user or "").strip(), password or ""
+        if not user or not password:
+            return {"ok": False, "error": "Enter a username and a password"}
+        port = int(self.settings.data["sunshine"].get("port") or 0)
+        result = await SunshineApi("127.0.0.1", "", "", port).create_login(user, password)
+        if result["ok"]:
+            self.settings.update({"sunshine": {"user": user, "password": password}})
+        return {"ok": result["ok"], "error": result["error"]}
+
+    async def sunshine_test_login(self) -> dict[str, Any]:
+        """Check the saved login against the Sunshine web UI on this device."""
+        api = self._local_api()
+        if not api:
+            return {"ok": False, "error": "No Sunshine login saved"}
+        return await api.test()
+
+    async def sunshine_submit_pin(self, pin: str, client_name: str, pairing_id: Optional[str] = None) -> dict[str, Any]:
+        """Pair a client with this device's Sunshine. ``paired`` reflects the real outcome."""
+        api = self._local_api()
+        if not api:
+            return {"ok": False, "paired": False, "error": "Set the Sunshine username and password first"}
+        pin = "".join(ch for ch in str(pin) if ch.isdigit())
+        if len(pin) != 4:
+            return {"ok": False, "paired": False, "error": "The PIN must have 4 digits"}
+        return await pair_client(api, pin, client_name.strip() or "Moonlight client", pairing_id or None)
+
+    async def sunshine_pending_pairings(self) -> dict[str, Any]:
+        api = self._local_api()
+        if not api:
+            return {"ok": False, "supported": False, "items": [], "error": "Set the Sunshine username and password first"}
+        return await api.pending_pairings()
+
+    async def sunshine_clients(self) -> dict[str, Any]:
+        api = self._local_api()
+        if not api:
+            return {"ok": False, "items": [], "error": "Set the Sunshine username and password first"}
+        return await api.clients()
+
+    async def sunshine_unpair(self, uuid: str) -> dict[str, Any]:
         api = self._local_api()
         if not api:
             return {"ok": False, "error": "Set the Sunshine username and password first"}
-        pin = "".join(ch for ch in str(pin) if ch.isdigit())
-        if len(pin) != 4:
-            return {"ok": False, "error": "The PIN must have 4 digits"}
-        return await api.submit_pin(pin, client_name.strip() or "Moonlight client")
+        return await api.unpair(uuid)
 
     # ------------------------------------------------------------------ diagnostics
 

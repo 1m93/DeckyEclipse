@@ -20,7 +20,9 @@ cp dist/index.js "$STAGE/dist/"
 cp -R bin py_modules "$STAGE/"
 cp main.py plugin.json package.json LICENSE README.md "$STAGE/"
 find "$STAGE" -name '__pycache__' -type d -prune -exec rm -rf {} +
-chmod +x "$STAGE/bin/eclipse_launcher.py"
+chmod +x "$STAGE/bin/eclipse_launcher.py" "$STAGE/bin/eclipse_sunshine_root.py"
+# Helpers of Sunshine for Gaming Mode (see py_modules/eclipse/sunshine_native.py).
+bash "$ROOT/scripts/build-native.sh" "$STAGE/bin/native"
 
 (cd "$ROOT/out" && zip -qr "$NAME-$VERSION.zip" "$NAME")
 echo "Created out/$NAME-$VERSION.zip"

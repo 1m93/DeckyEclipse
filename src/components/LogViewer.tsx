@@ -3,12 +3,19 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { backend } from "../backend";
 import { useStore } from "../lib/store";
 
-type LogSource = "plugin" | "launcher";
+export type LogSource = "plugin" | "launcher" | "sunshine";
 
 const SOURCES: { data: LogSource; label: string }[] = [
   { data: "plugin", label: "Plugin (installs, Sunshine API, errors)" },
   { data: "launcher", label: "Launcher (Moonlight command lines)" },
+  { data: "sunshine", label: "Sunshine on this device" },
 ];
+
+const READERS: Record<LogSource, () => Promise<string>> = {
+  plugin: () => backend.getPluginLog(),
+  launcher: () => backend.getLauncherLog(),
+  sunshine: () => backend.getSunshineLog(),
+};
 
 /** Lines per focusable block: lets the D-pad scroll through long logs. */
 const CHUNK_LINES = 12;
@@ -24,7 +31,7 @@ export function LogViewer({ initialSource = "plugin" }: { initialSource?: LogSou
   const installing = useStore((s) => s.installing);
 
   const refresh = useCallback(async () => {
-    setText(source === "plugin" ? await backend.getPluginLog() : await backend.getLauncherLog());
+    setText(await READERS[source]());
   }, [source]);
 
   useEffect(() => {

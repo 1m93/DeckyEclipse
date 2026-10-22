@@ -12,7 +12,7 @@ from typing import Any
 from .log import get_logger
 from .presets import AUTO_PRESET, STREAM_DEFAULTS
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 DEFAULTS: dict[str, Any] = {
     "version": SCHEMA_VERSION,
@@ -116,6 +116,23 @@ def strip_masked_fields(patch: Any) -> Any:
     return out
 
 
+def migrate(data: dict[str, Any], stored: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """Upgrade settings saved by older versions. Returns ``(data, changed)``.
+
+    A missing file is a fresh install and needs nothing: defaults are current.
+    """
+    if not stored:
+        return data, False
+    version = int(stored.get("version") or 1)
+    if version >= SCHEMA_VERSION:
+        return data, False
+    if version < 2:
+        # v2: ending a stream also ends the session on the host by default.
+        data["stream"]["quitAppAfter"] = True
+    data["version"] = SCHEMA_VERSION
+    return data, True
+
+
 class SettingsStore:
     def __init__(self, path: str) -> None:
         self.path = path
@@ -133,7 +150,14 @@ class SettingsStore:
         except (OSError, ValueError) as exc:
             get_logger().error("Failed to read settings, using defaults: %s", exc)
             stored = {}
-        return deep_merge(DEFAULTS, stored)
+        data, migrated = migrate(deep_merge(DEFAULTS, stored), stored)
+        if migrated and stored:
+            self._data = data
+            try:
+                self._write()
+            except OSError as exc:
+                get_logger().error("Failed to save migrated settings: %s", exc)
+        return data
 
     def reload(self) -> None:
         with self._lock:
@@ -177,7 +201,7 @@ def load_settings_readonly(path: str) -> dict[str, Any]:
         with open(path, "r", encoding="utf-8") as fh:
             stored = json.load(fh)
         if isinstance(stored, dict):
-            return deep_merge(DEFAULTS, stored)
+            return migrate(deep_merge(DEFAULTS, stored), stored)[0]
     except (OSError, ValueError):
         pass
     return copy.deepcopy(DEFAULTS)

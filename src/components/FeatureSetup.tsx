@@ -62,7 +62,8 @@ export function FeatureSetup() {
 
 const INSTALL_TEXT: Record<Feature, string> = {
   moonlight: "Moonlight is needed to stream from your PC. It can be installed from Flathub for your user.",
-  sunshine: "Sunshine is needed to share this device. It can be installed from Flathub for your user.",
+  sunshine:
+    "Sunshine is needed to share this device. Eclipse installs a build of it that can stream Gaming Mode (asks for your password once).",
 };
 
 /** Shown for an enabled feature whose app is missing. Installs only on request. */

@@ -19,11 +19,16 @@ export interface Host {
   addresses: HostAddress[];
   mac: string | null;
   apps: HostApp[];
+  /** Moonlight holds the host's certificate, i.e. pairing succeeded. */
+  paired?: boolean;
 }
 
 export interface HostStatus {
   online: boolean;
+  /** An app is open on the host (it may have no client attached). */
   busy: boolean;
+  /** Moonlight app id of the open app, matches `HostApp.id`. */
+  currentGame?: string | null;
   hostname?: string | null;
   version?: string | null;
   mac?: string | null;
@@ -70,6 +75,18 @@ export interface HostDisplay {
   /** Value for Sunshine's `output_name` (connector name on Linux, device id on Windows). */
   outputName: string;
   label: string;
+  /** Added by hand; kept even when Sunshine's list does not contain it. */
+  manual?: boolean;
+}
+
+export interface MonitorRefresh extends Result {
+  /** When Sunshine last listed its monitors (host clock, from its log). */
+  detectedAt?: string | null;
+  /** `output_name` Sunshine uses now; empty string means its default monitor. */
+  current?: string | null;
+  /** The selected monitor is gone and the selection was cleared. */
+  selectionLost?: boolean;
+  settings: Settings;
 }
 
 /** Per-host settings. Secrets come back masked as `<key>Set` booleans. */
@@ -78,6 +95,8 @@ export interface HostConfig {
   displays?: HostDisplay[];
   /** Selected `outputName`; unset means "do not change Sunshine's setting". */
   display?: string;
+  /** Ask which monitor to use every time a stream starts. */
+  askMonitor?: boolean;
   mac?: string;
   preset?: string;
   lastApp?: string;
@@ -184,13 +203,18 @@ export interface InitialState {
 
 export type AppOperation = "install" | "update" | "uninstall";
 
-/** Install state of Moonlight or Sunshine. Only Flatpak installs are `managed` by Eclipse. */
+/**
+ * Install state of Moonlight or Sunshine. Eclipse manages Flatpak installs and
+ * Sunshine for Gaming Mode (`installation: "eclipse"`).
+ */
 export interface AppStatus {
   installed: boolean;
   managed: boolean;
   version: string | null;
   installation: string | null;
   origin?: string;
+  /** Sunshine for Gaming Mode is installed and a Sunshine Flatpak is still there too. */
+  alsoFlatpak?: boolean;
 }
 
 export interface AppsStatus {
@@ -224,6 +248,13 @@ export interface InstallResult extends Result {
   warning?: string | null;
   /** True when the user cancelled the installation. */
   cancelled?: boolean;
+  /** sudo did not accept the password. */
+  passwordRejected?: boolean;
+}
+
+export interface StreamPrepareResult extends Result {
+  /** The selected host monitor is gone; the user should pick another one. */
+  monitorMissing?: boolean;
 }
 
 export interface PairResult extends Result {
@@ -243,10 +274,42 @@ export interface LibraryEntryResult extends Result {
   boxartAppId?: string;
 }
 
+export interface DiagnosticCheck {
+  id: string;
+  label: string;
+  /** true: fine · false: a problem · null: could not tell / not applicable. */
+  ok: boolean | null;
+  detail: string;
+  hint: string;
+}
+
+export interface SunshineDiagnostics {
+  checks: DiagnosticCheck[];
+  addresses: { interface: string; address: string }[];
+  logPath: string | null;
+}
+
+/** See `sunshine_login_state` in main.py. */
+export type SunshineLoginState = "ok" | "needs_setup" | "invalid" | "missing" | "unreachable";
+
+/** Sunshine for Gaming Mode, see py_modules/eclipse/sunshine_native.py. */
+export interface NativeSunshineState {
+  installed: boolean;
+  version: string | null;
+  /** The launcher has the capabilities needed to capture Gaming Mode. */
+  captureReady: boolean;
+  /** The plugin ships newer helpers than the installed ones: a repair installs them. */
+  helpersOutdated: boolean;
+}
+
 export interface SunshineStatus {
   installed: boolean;
-  kind: "systemd" | "flatpak" | "native" | null;
+  /** "eclipse": Sunshine for Gaming Mode. */
+  kind: "eclipse" | "systemd" | "flatpak" | "native" | null;
   unit: string | null;
+  /** A Sunshine Flatpak is installed (possibly next to Sunshine for Gaming Mode). */
+  flatpak: boolean;
+  native: NativeSunshineState | null;
   running: boolean;
   /** The plugin's autostart option. */
   autostart: boolean;
@@ -264,4 +327,27 @@ export interface StreamSession {
   startedAt: number;
   /** True once Steam reported the shortcut as running. */
   confirmed: boolean;
+  /** Set when Moonlight was opened to pair with this address, not to stream. */
+  pairAddress?: string;
+}
+
+/** A device waiting for its PIN to be entered (newer Sunshine). */
+export interface PendingPairing {
+  id: string;
+  name: string;
+  address: string;
+}
+
+export interface PairedClient {
+  uuid: string;
+  name: string;
+  enabled: boolean;
+}
+
+/** Result of entering a PIN; `paired` is the real outcome, not just "PIN sent". */
+export interface PairOutcome extends Result {
+  paired: boolean;
+  client?: string;
+  /** Several devices are waiting: pick one and retry with its id. */
+  choose?: PendingPairing[];
 }

@@ -11,7 +11,8 @@
     "typecheck": "tsc --noEmit",
     "test": "python3 -m unittest discover -s tests",
     "package": "bash scripts/package.sh",
-    "deploy": "bash scripts/deploy.sh"
+    "deploy": "bash scripts/deploy.sh",
+    "native": "bash scripts/build-native.sh"
   },
   "dependencies": {
     "@decky/api": "^1.1.3",
