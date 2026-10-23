@@ -47,6 +47,8 @@ DEFAULTS: dict[str, Any] = {
         "autostart": False,
         # Toast when another device starts or stops streaming from this one.
         "notifySessions": True,
+        # Toast when a device asks to pair (it waits for its PIN to be entered here).
+        "notifyPairing": True,
         # Turn Sunshine off when nobody streams: "never", "afterStream" (a minute
         # after the last device left) or a number of idle minutes ("15", "30", "60").
         "autoOff": "never",

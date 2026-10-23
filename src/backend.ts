@@ -125,7 +125,10 @@ export const backend = {
     Result & { games?: SteamGame[]; warnings?: string[]; settings?: Settings }
   >("backup_restore"),
   sunshineSetAutostart: callable<[enabled: boolean], Result>("sunshine_set_autostart"),
-  sunshineSubmitPin: callable<[pin: string, clientName: string, pairingId: string | null], PairOutcome>(
+  sunshineSubmitPin: callable<
+    [pin: string, clientName: string, pairingId: string | null, address: string | null],
+    PairOutcome
+  >(
     "sunshine_submit_pin",
   ),
   sunshinePendingPairings: callable<[], Result & { supported: boolean; items: PendingPairing[] }>(
@@ -160,4 +163,5 @@ export const Events = {
   streamProgress: "eclipse_stream_progress",
   sunshineSession: "eclipse_sunshine_session",
   sunshineAutoOff: "eclipse_sunshine_auto_off",
+  sunshinePairing: "eclipse_sunshine_pairing",
 } as const;

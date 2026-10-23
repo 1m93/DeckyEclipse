@@ -12,6 +12,7 @@ import {
 import { useEffect, useState } from "react";
 import { FaCheckCircle, FaTimesCircle } from "react-icons/fa";
 import { backend } from "../backend";
+import { pairingLabel } from "../lib/sunshine";
 import type { PendingPairing } from "../types";
 import { ButtonRow } from "./ButtonRow";
 
@@ -28,6 +29,11 @@ type Phase =
  * the real outcome. With newer Sunshine the waiting devices are listed and
  * the result is final; older Sunshine is confirmed via the paired-client list.
  */
+/** The suggested name, without Moonlight's placeholder ("roth"), which names no device. */
+function placeholderFree(name: string): string {
+  return name.trim().toLowerCase() === "roth" ? "" : name;
+}
+
 function SunshinePinModal({
   initial,
   onPaired,
@@ -41,11 +47,11 @@ function SunshinePinModal({
   const [target, setTarget] = useState<PendingPairing | null>(initial ?? null);
   const [supported, setSupported] = useState(Boolean(initial));
   const [pin, setPin] = useState("");
-  const [name, setName] = useState(initial?.name ?? "");
+  const [name, setName] = useState(placeholderFree(initial?.name ?? ""));
 
   const submit = async () => {
     setPhase({ kind: "pairing" });
-    const res = await backend.sunshineSubmitPin(pin, name, target?.id ?? null);
+    const res = await backend.sunshineSubmitPin(pin, name.trim(), target?.id ?? null, target?.address || null);
     if (res.ok && res.paired) {
       setPhase({ kind: "success", client: res.client ?? (name || "the device") });
       onPaired?.();
@@ -80,12 +86,12 @@ function SunshinePinModal({
                 key={item.id}
                 onClick={() => {
                   setTarget(item);
-                  setName(item.name);
+                  setName(placeholderFree(item.name));
                   setPhase({ kind: "form" });
                 }}
               >
-                {item.name}
-                {item.address ? ` (${item.address})` : ""}
+                {pairingLabel(item)}
+                {item.name && item.address ? ` (${item.address})` : ""}
               </DialogButton>
             ))}
           </Focusable>
@@ -97,7 +103,7 @@ function SunshinePinModal({
         <>
           <div style={{ marginBottom: 10, opacity: 0.85 }}>
             {target
-              ? `${target.name}${target.address ? ` (${target.address})` : ""} wants to pair. Enter the PIN it shows.`
+              ? `${pairingLabel(target)}${target.name && target.address ? ` (${target.address})` : ""} wants to pair. Enter the PIN it shows.`
               : supported
                 ? "No device is waiting yet. In Moonlight on the other device, select this device to start pairing, then enter the PIN it shows."
                 : "In Moonlight on the other device, select this device to start pairing, then enter the PIN it shows."}
@@ -110,7 +116,17 @@ function SunshinePinModal({
               focusOnMount
               onChange={(e) => setPin(e.target.value.replace(/\D/g, "").slice(0, 4))}
             />
-            <TextField label="Device name (optional)" value={name} onChange={(e) => setName(e.target.value)} />
+            <TextField
+              label="Name this device"
+              description={
+                target?.address
+                  ? `How it is listed under Devices. Moonlight does not send its name; empty: "Device ${target.address}".`
+                  : "How it is listed under Devices. Moonlight does not send its name."
+              }
+              placeholder="e.g. Linh's phone"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+            />
           </Focusable>
         </>
       );
@@ -124,7 +140,7 @@ function SunshinePinModal({
       body = (
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <Spinner style={{ width: 20, height: 20 }} />
-          Pairing{target ? ` with ${target.name}` : ""}... Keep Moonlight open on the other device.
+          Pairing{target ? ` with ${pairingLabel(target)}` : ""}... Keep Moonlight open on the other device.
         </div>
       );
       buttons = [];
@@ -172,7 +188,7 @@ function SunshinePinModal({
       }
       if (res.items[0]) {
         setTarget(res.items[0]);
-        setName(res.items[0].name);
+        setName(placeholderFree(res.items[0].name));
       }
       setPhase({ kind: "form" });
     });

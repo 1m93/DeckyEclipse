@@ -27,7 +27,7 @@ from eclipse.log import set_logger  # noqa: E402
 from eclipse.moonlight_config import MoonlightConfig, find_boxart  # noqa: E402
 from eclipse.presets import AUTO_PRESET, CUSTOM_PRESET, INHERIT_PRESET, all_presets, effective_stream  # noqa: E402
 from eclipse.settings import DEFAULTS as DEFAULT_SETTINGS, SettingsStore  # noqa: E402
-from eclipse.sunshine import LocalSunshine, SunshineApi, pair_client  # noqa: E402
+from eclipse.sunshine import LocalSunshine, SunshineApi, pair_client, pairing_device_name  # noqa: E402
 
 set_logger(decky.logger)
 log = decky.logger
@@ -44,6 +44,7 @@ SESSION_EVENT = "eclipse_sunshine_session"
 # Probes in a row Sunshine must miss before it counts as stopped.
 SESSION_MISSES_OFFLINE = 2
 AUTO_OFF_EVENT = "eclipse_sunshine_auto_off"
+PAIRING_EVENT = "eclipse_sunshine_pairing"
 # How often Sunshine's log is checked for a failed mDNS publication, and how
 # long to wait before trying to announce again after the responder failed.
 MDNS_CHECK_S = 20.0
@@ -102,6 +103,9 @@ class Plugin:
     # Reverse DNS names of streaming devices: address -> (looked up at, name).
     _peer_names: dict[str, tuple[float, Optional[str]]]
     _battery_guard: battery.BatteryGuard
+    # Pairing requests already announced, and whether this Sunshine can list them (None: not known yet).
+    _pairings_seen: set[str]
+    _pairings_supported: Optional[bool]
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -136,6 +140,8 @@ class Plugin:
         self._peers = PeerTracker()
         self._peer_names = {}
         self._battery_guard = battery.BatteryGuard()
+        self._pairings_seen = set()
+        self._pairings_supported = None
         log.info("Eclipse backend started (home=%s)", home)
 
         features = self.settings.data["features"]
@@ -1017,6 +1023,11 @@ class Plugin:
                     await self._apply_battery_guard(state)
                     if state["reachable"]:
                         await self._drop_duplicate_clients()
+                        await self._announce_pairings()
+                    else:
+                        # A restarted (maybe updated) Sunshine is asked again.
+                        self._pairings_supported = None
+                        self._pairings_seen.clear()
                 await self._sync_mdns(state)
             except asyncio.CancelledError:
                 raise
@@ -1062,6 +1073,22 @@ class Plugin:
         result = await self.local_sunshine.stop()
         if result["ok"]:
             await self._emit(AUTO_OFF_EVENT, f"Sunshine turned off: {reason}.")
+
+    async def _announce_pairings(self) -> None:
+        """Tell the frontend about devices that just asked to pair, even with the UI closed."""
+        if self._pairings_supported is False or not self._local_api():
+            return
+        result = await self.sunshine_pending_pairings()
+        if not result.get("ok"):
+            return
+        self._pairings_supported = bool(result.get("supported"))
+        items = result.get("items") or []
+        waiting = {item["id"] for item in items}
+        for item in items:
+            if item["id"] not in self._pairings_seen:
+                await self._emit(PAIRING_EVENT, item)
+        # Forget finished requests, so a device asking again is announced again.
+        self._pairings_seen = waiting
 
     async def _apply_battery_guard(self, state: dict[str, Any]) -> None:
         option = str(self.settings.data["sunshine"].get("batteryGuard") or "off")
@@ -1517,21 +1544,45 @@ class Plugin:
             return {"ok": False, "error": "No Sunshine login saved"}
         return await api.test()
 
-    async def sunshine_submit_pin(self, pin: str, client_name: str, pairing_id: Optional[str] = None) -> dict[str, Any]:
-        """Pair a client with this device's Sunshine. ``paired`` reflects the real outcome."""
+    async def sunshine_submit_pin(self, pin: str, client_name: str, pairing_id: Optional[str] = None,
+                                  address: Optional[str] = None) -> dict[str, Any]:
+        """Pair a client with this device's Sunshine. ``paired`` reflects the real outcome.
+
+        Without a name, the device is saved as "Device <address>" rather than Moonlight's placeholder.
+        """
         api = self._local_api()
         if not api:
             return {"ok": False, "paired": False, "error": "Set the Sunshine username and password first"}
         pin = "".join(ch for ch in str(pin) if ch.isdigit())
         if len(pin) != 4:
             return {"ok": False, "paired": False, "error": "The PIN must have 4 digits"}
-        return await pair_client(api, pin, client_name.strip() or "Moonlight client", pairing_id or None)
+        name = pairing_device_name(client_name) or (f"Device {address}" if address else "Moonlight client")
+        return await pair_client(api, pin, name[:64], pairing_id or None)
 
     async def sunshine_pending_pairings(self) -> dict[str, Any]:
+        """Devices waiting for a PIN. Moonlight sends no real device name, so ``name`` is a guess from
+        the network (reverse DNS) or empty, and ``label`` is what to show."""
         api = self._local_api()
         if not api:
             return {"ok": False, "supported": False, "items": [], "error": "Set the Sunshine username and password first"}
-        return await api.pending_pairings()
+        result = await api.pending_pairings()
+        items = result.get("items") or []
+        guesses = await asyncio.gather(
+            *(self._resolve_name(item["address"]) if not item["name"] and item["address"] else _none() for item in items)
+        )
+        for item, guess in zip(items, guesses):
+            item["name"] = item["name"] or guess or ""
+            item["label"] = item["name"] or (f"A device at {item['address']}" if item["address"] else "A device")
+        return result
+
+    async def _resolve_name(self, address: str) -> Optional[str]:
+        """Reverse DNS name of a device, waiting briefly (cached like the streaming devices)."""
+        cached = self._peer_names.get(address)
+        if cached and cached[1]:
+            return cached[1]
+        await self._lookup_peer_name(address)
+        found = self._peer_names.get(address)
+        return found[1] if found else None
 
     async def sunshine_clients(self) -> dict[str, Any]:
         api = self._local_api()
@@ -1562,6 +1613,10 @@ class Plugin:
     async def get_launcher_log(self) -> str:
         path = os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, LAUNCHER_LOG)
         return await asyncio.to_thread(_tail, path, LOG_TAIL_LINES)
+
+
+async def _none() -> None:
+    return None
 
 
 def _head(path: str, size: int) -> str:

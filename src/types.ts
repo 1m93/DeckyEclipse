@@ -151,6 +151,8 @@ export interface Settings {
     autostart: boolean;
     /** Toast when another device starts or stops streaming from this one. */
     notifySessions: boolean;
+    /** Toast when a device asks to pair. */
+    notifyPairing: boolean;
     /** Turn Sunshine off when nobody streams. */
     autoOff: SunshineAutoOff;
     /** Turn Sunshine off at this battery level (percent) while not charging. */
@@ -362,8 +364,11 @@ export interface StreamSession {
 /** A device waiting for its PIN to be entered (newer Sunshine). */
 export interface PendingPairing {
   id: string;
+  /** The device's name when known; "" when Moonlight only sent its placeholder ("roth"). */
   name: string;
   address: string;
+  /** What to show for it, e.g. "A device at 192.168.1.5". */
+  label?: string;
 }
 
 export interface PairedClient {

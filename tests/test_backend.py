@@ -1209,6 +1209,15 @@ class SunshineDataTests(unittest.TestCase):
         self.assertFalse(os.path.exists(self.new) or os.path.exists(self.legacy))
 
 
+class PairingNameTests(unittest.TestCase):
+    def test_moonlight_placeholder_is_no_name(self):
+        self.assertEqual(sunshine.pairing_device_name("roth"), "")
+        self.assertEqual(sunshine.pairing_device_name(" Roth "), "")
+        self.assertEqual(sunshine.pairing_device_name("Linh's phone"), "Linh's phone")
+        self.assertEqual(sunshine.plain_address("::ffff:192.168.1.5"), "192.168.1.5")
+        self.assertEqual(sunshine.plain_address("fe80::1"), "fe80::1")
+
+
 class SunshineConfigTests(unittest.TestCase):
     def test_reads_values_and_defaults(self):
         values = sunshine_config.read("# comment\nstream_audio = off\nmax_bitrate = 20000\ngamepad = nope\n")

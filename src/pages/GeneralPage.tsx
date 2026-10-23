@@ -181,6 +181,12 @@ export function GeneralPage() {
             checked={settings.sunshine.notifySessions}
             onChange={(checked) => updateSettings({ sunshine: { notifySessions: checked } }, 0)}
           />
+          <ToggleField
+            label="When a device wants to pair"
+            description="Notify when a device asks to pair, so its PIN can be entered here. Needs a Sunshine login saved in Eclipse."
+            checked={settings.sunshine.notifyPairing}
+            onChange={(checked) => updateSettings({ sunshine: { notifyPairing: checked } }, 0)}
+          />
         </DialogControlsSection>
       )}
 

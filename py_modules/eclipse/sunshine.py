@@ -27,6 +27,23 @@ _DETECT_CACHE_S = 60.0
 _RESTART_STOP_WAIT_S = 10.0
 
 
+# The device name every Moonlight client sends when pairing (hard-coded in moonlight-common-c):
+# it says nothing about the device, so it is not shown as its name.
+MOONLIGHT_PLACEHOLDER_NAMES = {"roth"}
+
+
+def pairing_device_name(name: Any) -> str:
+    """A pairing request's device name, or "" when it is Moonlight's placeholder."""
+    text = str(name or "").strip()
+    return "" if text.lower() in MOONLIGHT_PLACEHOLDER_NAMES else text
+
+
+def plain_address(address: Any) -> str:
+    """``::ffff:192.168.1.5`` -> ``192.168.1.5``."""
+    text = str(address or "").strip()
+    return text[7:] if text.lower().startswith("::ffff:") and text.count(".") == 3 else text
+
+
 # Sunshine answers every API call with this redirect (to /welcome) while no
 # web UI login has been created yet.
 NEEDS_SETUP_STATUS = 307
@@ -135,7 +152,7 @@ class SunshineApi:
         status, payload = await self.request("GET", "/api/pin")
         if status == 200 and isinstance(payload, dict) and isinstance(payload.get("pairings"), list):
             items = [
-                {"id": str(p.get("id", "")), "name": str(p.get("name") or "Unknown device"), "address": str(p.get("address") or "")}
+                {"id": str(p.get("id", "")), "name": pairing_device_name(p.get("name")), "address": plain_address(p.get("address"))}
                 for p in payload["pairings"] if isinstance(p, dict) and p.get("id")
             ]
             return {"ok": True, "supported": True, "items": items, "error": None}

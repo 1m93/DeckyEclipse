@@ -45,7 +45,14 @@ import {
   useStore,
   type QuickTab,
 } from "../lib/store";
-import { AUTO_OFF_OPTIONS, describeDevices, describeSunshine, repairReason, useSunshineStatus } from "../lib/sunshine";
+import {
+  AUTO_OFF_OPTIONS,
+  describeDevices,
+  describeSunshine,
+  pairingLabel,
+  repairReason,
+  useSunshineStatus,
+} from "../lib/sunshine";
 import type { PendingPairing, SunshineStatus } from "../types";
 import { showAddHostModal } from "./AddHostModal";
 import { ButtonRow } from "./ButtonRow";
@@ -260,7 +267,7 @@ function PairingRequests({ visible }: { visible: boolean }) {
         <PanelSectionRow key={request.id}>
           <ButtonItem
             layout="below"
-            label={`${request.name} wants to pair`}
+            label={`${pairingLabel(request)} wants to pair`}
             description={request.address || undefined}
             onClick={() =>
               showSunshinePinModal(request, () => {

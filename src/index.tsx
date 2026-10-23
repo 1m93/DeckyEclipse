@@ -5,6 +5,7 @@ import { EclipseIcon } from "./components/icons";
 import { QuickPanel } from "./components/QuickPanel";
 import { checkPluginUpdate, handleStreamEnded, incomingToastsMuted, notify } from "./lib/actions";
 import { ROUTE } from "./lib/navigation";
+import { pairingLabel } from "./lib/sunshine";
 import { registerLifetimeTracking, setStreamEndedHandler } from "./lib/steam";
 import {
   applyIncoming,
@@ -18,7 +19,7 @@ import {
   stopAllPolling,
 } from "./lib/store";
 import { EclipsePage } from "./pages/EclipsePage";
-import type { SunshineSession } from "./types";
+import type { PendingPairing, SunshineSession } from "./types";
 
 /** Decky's tab of the Quick Access menu (`EQuickAccessTab.Decky`; the enum only exists as a type). */
 const DECKY_QUICK_ACCESS_TAB = 999 as NonNullable<Parameters<typeof Navigation.OpenQuickAccessMenu>[0]>;
@@ -67,6 +68,20 @@ export default definePlugin(() => {
     notify(message);
     void refreshIncoming();
   });
+  const onPairing = addEventListener<[request: PendingPairing]>(Events.sunshinePairing, (request) => {
+    const settings = getState().settings;
+    if (!settings?.features.sunshine || !settings.sunshine.notifyPairing) return;
+    toaster.toast({
+      title: "Eclipse",
+      body: `${pairingLabel(request)} wants to pair. Press to enter the PIN it shows.`,
+      // Pairing requests expire after a few minutes: keep the toast up a bit longer.
+      duration: 15000,
+      onClick: () => {
+        setQuickTab("share", false);
+        Navigation.OpenQuickAccessMenu(DECKY_QUICK_ACCESS_TAB);
+      },
+    });
+  });
   const onPairResult = addEventListener<[ok: boolean, error: string | null]>(Events.pairResult, (ok, error) =>
     notify(ok ? "PIN accepted by Sunshine, finishing pairing..." : `Automatic PIN entry failed: ${error ?? "unknown error"}`),
   );
@@ -96,6 +111,7 @@ export default definePlugin(() => {
       removeEventListener(Events.sunshineSession, onIncoming);
       setIncomingHandler(null);
       removeEventListener(Events.sunshineAutoOff, onAutoOff);
+      removeEventListener(Events.sunshinePairing, onPairing);
       routerHook.removeRoute(ROUTE);
     },
   };

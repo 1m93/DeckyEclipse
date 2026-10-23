@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { backend } from "../backend";
-import type { StreamingDevice, SunshineAutoOff, SunshineBatteryGuard, SunshineStatus } from "../types";
+import type { PendingPairing, StreamingDevice, SunshineAutoOff, SunshineBatteryGuard, SunshineStatus } from "../types";
 import { notify, setSunshineAutostart } from "./actions";
 import { refreshIncoming, useStore } from "./store";
 
@@ -174,4 +174,18 @@ export function describeDevices(devices: StreamingDevice[] | undefined, clients 
   const names = devices.map((d) => (d.name ? `${d.name} (${d.address})` : `a device at ${d.address}`));
   const list = names.join(", ");
   return devices.length > clients ? `Probably from ${list}` : `From ${list}`;
+}
+
+/** Moonlight sends this name for every device when pairing; it is not the device's name. */
+const MOONLIGHT_PLACEHOLDER = "roth";
+
+/** How to show a device waiting to pair. */
+export function pairingLabel(request: PendingPairing): string {
+  const name = request.name.toLowerCase() === MOONLIGHT_PLACEHOLDER ? "" : request.name;
+  return request.label ?? (name || (request.address ? `A device at ${request.address}` : "A device"));
+}
+
+/** How to show a paired device: devices paired with Moonlight's placeholder name get a clearer one. */
+export function clientLabel(name: string): string {
+  return name.trim().toLowerCase() === MOONLIGHT_PLACEHOLDER || !name.trim() ? "Unnamed device" : name;
 }

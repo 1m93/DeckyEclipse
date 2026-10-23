@@ -2,6 +2,7 @@ import { ButtonItem, ConfirmModal, DialogControlsSection, DialogControlsSectionH
 import { useCallback, useEffect, useState } from "react";
 import { backend } from "../backend";
 import { notify } from "../lib/actions";
+import { clientLabel, pairingLabel } from "../lib/sunshine";
 import type { PairedClient, PendingPairing } from "../types";
 import { showSunshinePinModal } from "./SunshinePinModal";
 
@@ -11,13 +12,13 @@ const PENDING_POLL_MS = 3000;
 function confirmUnpair(client: PairedClient, onDone: () => void) {
   showModal(
     <ConfirmModal
-      strTitle={`Unpair ${client.name}?`}
+      strTitle={`Unpair ${clientLabel(client.name)}?`}
       strDescription="The device can no longer stream from here until it pairs again."
       strOKButtonText="Unpair"
       bDestructiveWarning
       onOK={async () => {
         const res = await backend.sunshineUnpair(client.uuid);
-        notify(res.ok ? `Unpaired ${client.name}` : (res.error ?? "Could not unpair"));
+        notify(res.ok ? `Unpaired ${clientLabel(client.name)}` : (res.error ?? "Could not unpair"));
         onDone();
       }}
     />,
@@ -94,7 +95,7 @@ export function SunshineDevicesSection({
       {pending.map((request) => (
         <ButtonItem
           key={request.id}
-          label={`${request.name} wants to pair`}
+          label={`${pairingLabel(request)} wants to pair`}
           description={request.address || undefined}
           onClick={() => showSunshinePinModal(request, afterPairing)}
         >
@@ -123,8 +124,14 @@ export function SunshineDevicesSection({
           clients.map((client) => (
             <ButtonItem
               key={client.uuid}
-              label={client.name}
-              description={client.enabled === false ? "Disabled in Sunshine" : undefined}
+              label={clientLabel(client.name)}
+              description={
+                client.enabled === false
+                  ? "Disabled in Sunshine"
+                  : clientLabel(client.name) !== client.name
+                    ? "Moonlight sent no name when it paired. To name it, unpair and pair it again."
+                    : undefined
+              }
               onClick={() =>
                 confirmUnpair(client, () => {
                   void loadClients();
