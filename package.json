@@ -1,6 +1,6 @@
 {
   "name": "decky-eclipse",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Moonlight & Sunshine game streaming control for SteamOS Gaming Mode.",
   "type": "module",
   "private": true,
