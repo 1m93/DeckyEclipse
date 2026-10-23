@@ -111,6 +111,8 @@ export interface HostConfig {
   sunshinePassword?: string;
   sunshinePasswordSet?: boolean;
   sunshinePort?: number;
+  /** More addresses of the host saved in Eclipse, e.g. its Tailscale address for away from home. */
+  extraAddresses?: string[];
 }
 
 export interface LibraryEntry {
@@ -122,6 +124,8 @@ export interface LibraryEntry {
 
 /** "afterStream": a minute after the last device left; numbers: idle minutes. */
 export type SunshineAutoOff = "never" | "afterStream" | "15" | "30" | "60";
+
+export type SunshineBatteryGuard = "off" | "10" | "20" | "30";
 
 export type MoonlightSource = "auto" | "flatpak" | "native" | "custom";
 
@@ -149,6 +153,10 @@ export interface Settings {
     notifySessions: boolean;
     /** Turn Sunshine off when nobody streams. */
     autoOff: SunshineAutoOff;
+    /** Turn Sunshine off at this battery level (percent) while not charging. */
+    batteryGuard: SunshineBatteryGuard;
+    /** Announce Sunshine over mDNS when it cannot do so itself. */
+    announce: boolean;
   };
   behavior: {
     autoWake: boolean;
@@ -386,6 +394,14 @@ export interface SunshineSession {
   clients: number;
   /** When the current session started (epoch ms). */
   since: number | null;
+  /** Devices seen talking to Sunshine around the session (best effort, see PeerTracker). */
+  devices?: StreamingDevice[];
+}
+
+export interface StreamingDevice {
+  address: string;
+  /** From reverse DNS, when the network knows it. */
+  name: string | null;
 }
 
 /** What the Quick Access menu shows about sharing this device. */
@@ -393,6 +409,12 @@ export interface SunshineOverview {
   address: string | null;
   /** Paired devices, or null without a working Sunshine login. */
   paired: number | null;
+  /** This device's Tailscale address, when Tailscale runs. */
+  remoteAddress?: string | null;
+  /** Eclipse announces Sunshine over mDNS (Sunshine could not). */
+  announced?: boolean;
+  /** How other devices find this one, see `_announce_state` in main.py. */
+  announce?: "active" | "notNeeded" | "failed" | "off" | "unknown";
 }
 
 export interface EndSessionResult extends Result {
@@ -447,4 +469,68 @@ export interface DiscoveredHost {
   name: string;
   /** Already added (paired in Moonlight). */
   known: boolean;
+  /** Found on the local network or through Tailscale. */
+  via?: "lan" | "tailscale";
+  /** The paired host's id, when it is already added. */
+  uuid?: string | null;
+  /** Already added, but this address is new: it can be saved as another way to reach it. */
+  newAddress?: boolean;
+}
+
+export interface NetworkTestResult extends Result {
+  address?: string;
+  iface?: string | null;
+  wireless?: boolean;
+  signalDbm?: number | null;
+  linkMbps?: number | null;
+  freqMhz?: number | null;
+  latencyMs?: number | null;
+  jitterMs?: number;
+  lossPct?: number;
+  /** Stability: jitter and lost attempts (stutter). */
+  verdict?: "great" | "good" | "fair" | "poor" | "unreachable";
+  /** Delay: input lag. */
+  delay?: "low" | "medium" | "high" | "unreachable";
+  /** Reached over the internet or a VPN. */
+  remote?: boolean;
+  vpn?: boolean;
+  attempts?: number;
+  failed?: number;
+  suggestedKbps?: number | null;
+  notes?: string[];
+}
+
+export interface SteamGame {
+  appId: number;
+  name: string;
+}
+
+/** An app Moonlight sees in the Sunshine on this device. */
+export interface SunshineApp {
+  index: number;
+  name: string;
+  /** The Steam game it starts, for games added from the Steam library. */
+  steamAppId: number | null;
+  hasCover: boolean;
+}
+
+export interface BackupLocation {
+  id: string;
+  label: string;
+  path: string;
+  removable: boolean;
+}
+
+export interface BackupInfo {
+  name: string;
+  locationId: string;
+  /** "This device", "microSD card"... */
+  location: string;
+  /** Set when the file cannot be used. */
+  error: string | null;
+  createdAt: number;
+  hasPasswords: boolean;
+  profiles: number;
+  hosts: number;
+  games: number;
 }

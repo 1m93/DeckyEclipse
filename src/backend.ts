@@ -1,6 +1,8 @@
 import { callable } from "@decky/api";
 import type {
   AppsStatus,
+  BackupInfo,
+  BackupLocation,
   AppUpdateCheck,
   DiagnosticCheck,
   DiscoveredHost,
@@ -16,6 +18,7 @@ import type {
   LibraryEntryResult,
   MonitorRefresh,
   MoonlightInfo,
+  NetworkTestResult,
   PairedClient,
   PairOutcome,
   PairResult,
@@ -26,7 +29,9 @@ import type {
   QuitResult,
   Result,
   Settings,
+  SteamGame,
   StreamPrepareResult,
+  SunshineApp,
   SunshineDiagnostics,
   SunshineLoginState,
   SunshineOptions,
@@ -47,7 +52,12 @@ export const backend = {
     "set_host_config",
   ),
   refreshMoonlight: callable<[], MoonlightInfo>("refresh_moonlight"),
-  discoverHosts: callable<[], Result & { items: DiscoveredHost[]; scanned: boolean }>("discover_hosts"),
+  discoverHosts: callable<
+    [],
+    Result & { items: DiscoveredHost[]; scanned: boolean; tailscale: "running" | "stopped" | "missing" }
+  >("discover_hosts"),
+  addHostAddress: callable<[uuid: string, address: string], Result & { settings?: Settings }>("add_host_address"),
+  hostNetworkTest: callable<[uuid: string], NetworkTestResult>("host_network_test"),
 
   wakeHost: callable<[uuid: string], Result>("wake_host"),
   prepareStream: callable<[uuid: string, appName: string], StreamPrepareResult>("prepare_stream"),
@@ -92,6 +102,28 @@ export const backend = {
   sunshineRestart: callable<[], Result>("sunshine_restart"),
   sunshineGetOptions: callable<[], SunshineOptionsResult>("sunshine_get_options"),
   sunshineSetOptions: callable<[patch: Partial<SunshineOptions>], SunshineOptionsResult>("sunshine_set_options"),
+  sunshineGames: callable<[], Result & { games: SteamGame[]; apps: SunshineApp[]; needsRestart?: boolean }>(
+    "sunshine_games",
+  ),
+  sunshineGameCover: callable<[appId: number], Result & { mime?: string; data?: string }>("sunshine_game_cover"),
+  sunshineSaveGameCover: callable<[appId: number, pngBase64: string], Result>("sunshine_save_game_cover"),
+  sunshineAddGames: callable<[games: SteamGame[]], Result & { added?: number; needsRestart?: boolean }>(
+    "sunshine_add_games",
+  ),
+  sunshineRemoveGames: callable<[appIds: number[]], Result & { removed?: number; needsRestart?: boolean }>(
+    "sunshine_remove_games",
+  ),
+  backupList: callable<[], Result & { items: BackupInfo[]; locations: BackupLocation[]; folder: string }>(
+    "backup_list",
+  ),
+  backupCreate: callable<[includePasswords: boolean, locationId: string], Result & { path?: string; name?: string }>(
+    "backup_create",
+  ),
+  backupDelete: callable<[locationId: string, name: string], Result>("backup_delete"),
+  backupRestore: callable<
+    [locationId: string, name: string],
+    Result & { games?: SteamGame[]; warnings?: string[]; settings?: Settings }
+  >("backup_restore"),
   sunshineSetAutostart: callable<[enabled: boolean], Result>("sunshine_set_autostart"),
   sunshineSubmitPin: callable<[pin: string, clientName: string, pairingId: string | null], PairOutcome>(
     "sunshine_submit_pin",

@@ -50,6 +50,11 @@ DEFAULTS: dict[str, Any] = {
         # Turn Sunshine off when nobody streams: "never", "afterStream" (a minute
         # after the last device left) or a number of idle minutes ("15", "30", "60").
         "autoOff": "never",
+        # Turn Sunshine off when the battery falls to this level (percent) while not
+        # charging: "off", "10", "20" or "30".
+        "batteryGuard": "off",
+        # Answer mDNS for Sunshine when it cannot publish through avahi-daemon.
+        "announce": True,
     },
     "behavior": {
         "autoWake": True,
@@ -184,6 +189,13 @@ class SettingsStore:
     def update(self, patch: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
             self._data = deep_merge(self._data, strip_masked_fields(patch))
+            self._write()
+        return self._data
+
+    def replace(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Replace every setting (restoring a backup); missing ones get their defaults."""
+        with self._lock:
+            self._data = deep_merge(DEFAULTS, {**strip_masked_fields(data), "version": SCHEMA_VERSION})
             self._write()
         return self._data
 

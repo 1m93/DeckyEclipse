@@ -4,6 +4,7 @@ import { backend } from "../backend";
 import { FEATURE_LABELS, installFeature, saveFeatures } from "../lib/actions";
 import { useStore } from "../lib/store";
 import type { Feature } from "../types";
+import { RestoreFromBackupButton } from "./BackupSection";
 import { InstallProgress } from "./InstallProgress";
 
 /** First-run choice of features. Nothing is installed or started from here. */
@@ -56,6 +57,7 @@ export function FeatureSetup() {
           Continue
         </ButtonItem>
       </PanelSectionRow>
+      <RestoreFromBackupButton />
     </PanelSection>
   );
 }

@@ -412,6 +412,18 @@ class LocalSunshine:
         info = await self.detect()
         return self.flatpak_config_path if info["kind"] == "flatpak" else self.config_path
 
+    async def config_dir(self) -> str:
+        """Sunshine's config directory (sunshine.conf, apps.json) for the detected install."""
+        return os.path.dirname(await self._config_file())
+
+    async def is_flatpak(self) -> bool:
+        return (await self.detect())["kind"] == "flatpak"
+
+    def mark_changed(self, running: bool) -> None:
+        """A file Sunshine reads at startup changed: a running Sunshine needs a restart."""
+        if running:
+            self.config_pending = True
+
     async def read_options(self) -> dict[str, Any]:
         path = await self._config_file()
 

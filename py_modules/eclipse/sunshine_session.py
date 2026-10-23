@@ -290,3 +290,98 @@ class AutoOff:
             minutes = int(option)
             return f"nobody streamed for {minutes} minutes" if idle >= minutes * 60 else None
         return None
+
+
+# ---------------------------------------------------------------- which devices stream
+
+def client_tcp_ports(http_port: int = 47989) -> tuple[int, ...]:
+    """Sunshine's TCP ports a client uses: HTTPS (app list, launch), HTTP, RTSP (stream setup)."""
+    return (http_port - 5, http_port, http_port + 21)
+
+
+CLIENT_TCP_PORTS = client_tcp_ports()
+# A device that talked to Sunshine this long before a session started is taken as its device.
+PEER_BEFORE_START_S = 30.0
+# Devices that start talking to Sunshine this soon after the session started count too (a second client).
+PEER_AFTER_START_S = 20.0
+# ESTABLISHED, and TIME_WAIT: Sunshine closes its side of each short exchange, which then waits ~60 s.
+_TCP_STATES = ("01", "06")
+
+
+def _hex_address(text: str) -> Optional[tuple[str, int]]:
+    """Address and port of a /proc/net/tcp(6) column such as ``0100007F:BB8D``."""
+    address, _, port = text.partition(":")
+    try:
+        raw = bytes.fromhex(address)
+        number = int(port, 16)
+    except ValueError:
+        return None
+    if len(raw) == 4:
+        return ".".join(str(b) for b in raw[::-1]), number
+    if len(raw) == 16:
+        # Four little-endian 32-bit words; only IPv4-mapped addresses are of interest.
+        words = b"".join(raw[i:i + 4][::-1] for i in range(0, 16, 4))
+        if words[:12] == b"\x00" * 10 + b"\xff\xff":
+            return ".".join(str(b) for b in words[12:]), number
+        return None
+    return None
+
+
+def tcp_peers(text: str, ports: tuple[int, ...] = CLIENT_TCP_PORTS, own: frozenset[str] = frozenset()) -> set[str]:
+    """Remote addresses with a recent connection to one of ``ports`` (from /proc/net/tcp).
+
+    ``own``: this device's addresses, e.g. its own host discovery reaching itself.
+    """
+    peers: set[str] = set()
+    for line in text.splitlines()[1:]:
+        fields = line.split()
+        if len(fields) < 4 or fields[3] not in _TCP_STATES:
+            continue
+        local, remote = _hex_address(fields[1]), _hex_address(fields[2])
+        if local and remote and local[1] in ports and not remote[0].startswith("127.") and remote[0] not in own:
+            peers.add(remote[0])
+    return peers
+
+
+def read_tcp_peers(ports: tuple[int, ...] = CLIENT_TCP_PORTS, own: frozenset[str] = frozenset()) -> set[str]:
+    peers: set[str] = set()
+    for path in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                peers |= tcp_peers(fh.read(), ports, own)
+        except OSError:
+            continue
+    return peers
+
+
+class PeerTracker:
+    """Devices streaming from here, as far as the network shows.
+
+    Sunshine does not log which device connects. A client talks to Sunshine
+    over TCP right before streaming (app list, launch, RTSP setup), so the
+    devices seen shortly before a session starts, or right after it started,
+    are taken as its devices. Others seen later (e.g. a Moonlight just
+    browsing) are not added.
+    """
+
+    def __init__(self) -> None:
+        self.seen: dict[str, float] = {}
+        self.session: list[str] = []
+        self.started: Optional[float] = None
+
+    def update(self, peers: set[str], clients: int, now: float) -> list[str]:
+        for address in peers:
+            self.seen[address] = now
+        for address in [a for a, at in self.seen.items() if now - at > PEER_BEFORE_START_S + PEER_AFTER_START_S]:
+            del self.seen[address]
+        if clients <= 0:
+            self.session, self.started = [], None
+            return []
+        if self.started is None:
+            self.started = now
+        if now - self.started <= PEER_AFTER_START_S:
+            window = self.started - PEER_BEFORE_START_S
+            for address in sorted(self.seen, key=lambda a: self.seen[a]):
+                if self.seen[address] >= window and address not in self.session:
+                    self.session.append(address)
+        return list(self.session)

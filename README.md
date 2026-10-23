@@ -35,6 +35,11 @@ The Quick Access menu treats both halves the same:
 - The full-screen settings follow the same order: *Streaming* (profiles, stream quality and hosts), then
   *Sharing*, then *General*, *Troubleshooting* (connection checks and logs) and *About*.
 
+**Backup**: *General → Backup* saves profiles, stream and host settings, Sunshine's options and the Steam games
+offered to other devices (passwords only when asked for) to `~/Documents/Eclipse`, or to the `Eclipse` folder of a
+microSD card or USB drive, which survives reinstalling SteamOS. Backups on any of them are listed for restore,
+also on the welcome screen of a fresh install. Pairing is not part of a backup.
+
 **Streaming (Moonlight client)**
 
 - Lists paired hosts from Moonlight's own config and shows them as online, busy or offline, with latency.
@@ -42,7 +47,14 @@ The Quick Access menu treats both halves the same:
 - Wake-on-LAN: the MAC address is read from Moonlight or Sunshine, or you can enter it yourself. Offline hosts
   are woken automatically before a stream starts.
 - *Add host* lists the PCs running Sunshine on your network (it asks each address of this device's /24 network
-  for `/serverinfo`), so you do not need to know the PC's IP address. You can still type one.
+  for `/serverinfo`), so you do not need to know the PC's IP address. You can still type one. When Tailscale
+  runs on this device, PCs in your tailnet are listed too ("via Tailscale"). For a PC already added at home,
+  pressing it saves its Tailscale address, so the same host streams away from home (Eclipse then hands Moonlight
+  the address that answers).
+- *Network test* (host settings, Y on a host, or the *Playing* card) measures delay (input lag) and stability
+  (jitter, failed tries: stutter) to the host, reads this device's link (wired, VPN, or Wi-Fi band, signal and
+  rate) and suggests a bitrate, with a button to lower the one in use (global settings, or the host's profile).
+  Over the internet or a VPN it stays at 15 Mbps: the host's upload speed cannot be measured from here.
 - Pairing from Gaming Mode: Eclipse makes the PIN and shows it in a large dialog and a notification. If you save
   the host's Sunshine web UI credentials, Eclipse enters the PIN on the host for you.
 - The default quality preset is **Auto: match display**. It picks resolution, frame rate and bitrate for the
@@ -111,6 +123,19 @@ The Quick Access menu treats both halves the same:
 - A Sunshine Flatpak is still detected and controlled, but it cannot stream Gaming Mode. Eclipse offers to
   install Sunshine for Gaming Mode instead and to remove the Flatpak.
 - Pair Moonlight clients with your Deck and see the real result (paired, wrong PIN, timed out).
+- **Steam games for other devices**: *Add Steam games* lists the installed games and adds the chosen ones to
+  Sunshine's `apps.json`, so Moonlight on another device starts them directly (`steam steam://rungameid/<id>`).
+  Covers come from Steam's cache, converted to the PNG Sunshine needs. Closing the app (Quit in Moonlight, or
+  *Close app* here) also ends the game on this device.
+- **Discovery fix**: on SteamOS, Sunshine may not be allowed to publish itself through avahi-daemon
+  (`avahi::entry_group_new() failed: Not permitted`), so Moonlight never lists the device. Eclipse notices the
+  error in Sunshine's log and answers the mDNS queries for `_nvstream._tcp` itself (*Help other devices find
+  this one*, on by default).
+- The *Sharing* card names the devices streaming from here as far as the network shows: those that talked to
+  Sunshine just before the stream, by reverse DNS name when the router knows it.
+- **Turn off on low battery** (off by default): Sunshine turns off when the battery falls to 10/20/30 % while
+  not charging, after the current stream (or at 5 % during it). If you turn Sunshine on while already below the
+  level, it stays on.
 - **Sunshine's own options** in *Sharing*, so the web page is rarely needed: the name shown in Moonlight,
   maximum bitrate, encoder, HEVC/AV1, minimum frame rate, error correction, audio, controllers (type, Back for
   Home), keyboard, mouse, touch, encryption, UPnP, IPv6, web page access, timeout and log detail. The Share tab
@@ -193,6 +218,10 @@ py_modules/eclipse/         Shared Python modules (no dependency on Decky)
   sunshine.py               Sunshine web API client, local service control
   sunshine_native.py        Sunshine for Gaming Mode (shared with the root installer)
   sunshine_config.py        Options of the local Sunshine (sunshine.conf)
+  sunshine_apps.py          Steam library and Sunshine's apps.json
+  mdns.py                   mDNS responder announcing Sunshine when avahi refuses
+  nettest.py / tailscale.py Connection test, Tailscale peers
+  battery.py / backup.py    Low-battery guard, settings backups
 bin/eclipse_sunshine_root.py  Root installer of Sunshine for Gaming Mode (run with sudo)
 native/                     C helpers of Sunshine for Gaming Mode (launcher, preload library)
   host_display.py           Host display detection/switching via Sunshine output_name

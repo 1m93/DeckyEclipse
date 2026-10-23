@@ -24,6 +24,8 @@ from eclipse import sunshine_session  # noqa: E402
 from eclipse import account  # noqa: E402
 from eclipse import sunshine_data  # noqa: E402
 from eclipse import sunshine_config  # noqa: E402
+from eclipse import backup, battery, mdns, nettest, sunshine_apps, tailscale  # noqa: E402
+from eclipse.settings import DEFAULTS  # noqa: E402
 
 SAMPLE_CONF = r"""
 [General]
@@ -1230,6 +1232,281 @@ class SunshineConfigTests(unittest.TestCase):
                       {"sunshine_name": "a\nb"}, {"sunshine_name": "Deck #1"}, {"sunshine_name": "[Deck"}, {"fec_percentage": 1.5}, {"ping_timeout": True}):
             with self.assertRaises(ValueError, msg=str(patch)):
                 sunshine_config.apply("", patch)
+
+
+class MdnsTests(unittest.TestCase):
+    service = mdns.Service("Ally", "ally-sunshine", 47989, ("192.168.2.47",))
+
+    def query(self, name, qtype, msg_id=0, unicast=False):
+        qclass = mdns.CLASS_IN | (mdns.CLASS_TOP_BIT if unicast else 0)
+        import struct
+        return struct.pack("!HHHHHH", msg_id, 0, 1, 0, 0, 0) + mdns.encode_name(name) + struct.pack("!HH", qtype, qclass)
+
+    def test_browse_query_gets_ptr_with_srv_txt_and_address(self):
+        query = mdns.parse_query(self.query("_nvstream._tcp.local", mdns.TYPE_PTR))
+        answers, additional = mdns.answer(query, self.service)
+        self.assertEqual([r.rtype for r in answers], [mdns.TYPE_PTR])
+        self.assertEqual(sorted(r.rtype for r in additional), [mdns.TYPE_A, mdns.TYPE_TXT, mdns.TYPE_SRV])
+        packet = mdns.build_response(answers, additional)
+        self.assertIsNone(mdns.parse_query(packet), "a response is not taken for a query")
+        self.assertIn(b"\x04_tcp\x05local", packet)
+
+    def test_names_are_case_insensitive_and_others_ignored(self):
+        query = mdns.parse_query(self.query("ALLY-SUNSHINE.local", mdns.TYPE_A, unicast=True))
+        self.assertTrue(query.questions[0].unicast)
+        answers, _ = mdns.answer(query, self.service)
+        self.assertEqual(answers[0].rdata, bytes([192, 168, 2, 47]))
+        other = mdns.parse_query(self.query("_airplay._tcp.local", mdns.TYPE_PTR))
+        self.assertEqual(mdns.answer(other, self.service), ([], []))
+
+    def test_compressed_names_and_garbage(self):
+        import struct
+        data = struct.pack("!HHHHHH", 0, 0, 2, 0, 0, 0) + mdns.encode_name("_nvstream._tcp.local")
+        data += struct.pack("!HH", 12, 1) + b"\xc0\x0c" + struct.pack("!HH", 255, 1)
+        query = mdns.parse_query(data)
+        self.assertEqual([q.name for q in query.questions], ["_nvstream._tcp.local"] * 2)
+        self.assertIsNone(mdns.parse_query(data[:-3]))
+        self.assertIsNone(mdns.parse_query(b"\x00" * 5 + b"\x01" + b"\x00" * 6 + b"\xc0\x0c"), "pointer loop")
+
+    def test_publish_failure_only_counts_for_the_latest_run(self):
+        failed = "[t]: Error: avahi::entry_group_new() failed: Not permitted\n"
+        self.assertTrue(mdns.publish_failed("[t]: Info: Sunshine version: 1\n" + failed))
+        self.assertFalse(mdns.publish_failed(failed + "[t]: Info: Sunshine version: 2\nAvahi service x successfully established."))
+
+    def test_labels(self):
+        self.assertEqual(mdns.dns_label("1m93 Ally!-sunshine"), "1m93-Ally-sunshine")
+        self.assertEqual(mdns.dns_label("!!!"), "device")
+        self.assertLessEqual(len(mdns.instance_label("é" * 80).encode()), 63)
+        self.assertEqual(mdns.instance_label("Deck 2.0."), "Deck 2 0")
+        mdns.Service(mdns.instance_label("Deck."), "h", 1, ("10.0.0.1",)).records()
+
+
+class SunshineAppsTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = self.tmp.name
+        self.steamapps = os.path.join(self.home, ".local", "share", "Steam", "steamapps")
+        os.makedirs(self.steamapps)
+        self.config = os.path.join(self.home, ".config", "sunshine")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def manifest(self, folder, app_id, name, flags=4):
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, f"appmanifest_{app_id}.acf"), "w") as fh:
+            fh.write(f'"AppState"\n{{\n\t"appid"\t\t"{app_id}"\n\t"name"\t\t"{name}"\n\t"StateFlags"\t\t"{flags}"\n}}\n')
+
+    def test_installed_games_across_libraries_without_tools(self):
+        sd = os.path.join(self.home, "sd", "steamapps")
+        with open(os.path.join(self.steamapps, "libraryfolders.vdf"), "w") as fh:
+            fh.write('"libraryfolders"\n{\n\t"0"\n\t{\n\t\t"path"\t\t"%s"\n\t}\n\t"1"\n\t{\n\t\t"path"\t\t"%s"\n\t}\n}\n'
+                     % (os.path.dirname(self.steamapps), os.path.dirname(sd)))
+        self.manifest(self.steamapps, 620, "Portal 2")
+        self.manifest(self.steamapps, 1493710, "Proton Experimental")
+        self.manifest(self.steamapps, 999, 'Half \\"Quoted\\" Game', flags=6)
+        self.manifest(sd, 1145360, "Hades")
+        self.manifest(sd, 70, "Downloading", flags=1026 & ~4)
+        games = sunshine_apps.installed_games(self.home)
+        self.assertEqual([g["name"] for g in games], ['Hades', 'Half "Quoted" Game', "Portal 2"])
+
+    def test_add_and_remove_games_keep_other_apps(self):
+        added = sunshine_apps.add_games(self.config, [{"appId": 620, "name": "Portal 2"}, {"appId": 620, "name": "x"}], False)
+        self.assertEqual(added, 1)
+        apps = sunshine_apps.list_apps(self.config)
+        self.assertEqual([a["name"] for a in apps], ["Desktop", "Steam Big Picture", "Portal 2"])
+        self.assertEqual(apps[2]["steamAppId"], 620)
+        self.assertEqual(apps[1]["steamAppId"], None, "Big Picture is not a game")
+        data = json.load(open(sunshine_apps.apps_path(self.config)))
+        self.assertEqual(data["apps"][2]["detached"], ["setsid steam steam://rungameid/620"])
+        undo = data["apps"][2]["prep-cmd"][0]["undo"]
+        self.assertTrue(undo.startswith("sh ") and undo.endswith(" 620"))
+        self.assertTrue(os.access(os.path.join(self.config, sunshine_apps.QUIT_SCRIPT), os.X_OK))
+        self.assertIsNone(sunshine_apps.steam_app_id({"detached": ["steam steam://rungameid/17293822569102704640"]}))
+        self.assertEqual(sunshine_apps.add_games(self.config, [{"appId": 620, "name": "Portal 2"}], False), 0)
+        self.assertEqual(sunshine_apps.remove_games(self.config, [620]), 1)
+        self.assertEqual(len(sunshine_apps.list_apps(self.config)), 2)
+
+    def test_cover_is_used_and_flatpak_runs_on_host(self):
+        import base64
+        png = sunshine_apps.PNG_SIGNATURE + b"data"
+        sunshine_apps.save_cover(self.config, 620, base64.b64encode(png).decode())
+        sunshine_apps.add_games(self.config, [{"appId": 620, "name": "Portal 2"}], True)
+        app = sunshine_apps.read_apps(self.config)["apps"][-1]
+        self.assertEqual(app["image-path"], sunshine_apps.cover_path(self.config, 620))
+        self.assertTrue(app["detached"][0].startswith("flatpak-spawn --host steam"))
+        with self.assertRaises(ValueError):
+            sunshine_apps.save_cover(self.config, 1, base64.b64encode(b"\xff\xd8jpeg").decode())
+
+    def test_broken_apps_file_is_not_overwritten(self):
+        os.makedirs(self.config)
+        with open(sunshine_apps.apps_path(self.config), "w") as fh:
+            fh.write("{broken")
+        with self.assertRaises(ValueError):
+            sunshine_apps.add_games(self.config, [{"appId": 1, "name": "A"}], False)
+        self.assertEqual(open(sunshine_apps.apps_path(self.config)).read(), "{broken")
+
+
+class NetTestTests(unittest.TestCase):
+    def test_parsers(self):
+        wireless = "Inter-| sta-|\n face | tus |\n wlan0: 0000   54.  -56.  -256        0      0\n"
+        self.assertEqual(nettest.parse_wireless(wireless, "wlan0"), -56)
+        self.assertIsNone(nettest.parse_wireless(wireless, "eth0"))
+        link = nettest.parse_iw_link("Connected to x\n\tfreq: 5180\n\tsignal: -52 dBm\n\ttx bitrate: 866.7 MBit/s VHT-MCS 9\n")
+        self.assertEqual((link["txMbps"], link["signalDbm"], link["freqMhz"]), (866.7, -52.0, 5180.0))
+
+    def test_suggestions(self):
+        wired = nettest.suggest([1.0, 1.2, 0.9], {"wireless": False})
+        self.assertEqual((wired["verdict"], wired["suggestedKbps"]), ("great", 100000))
+        wifi = nettest.suggest([4.0] * 10, {"wireless": True, "linkMbps": 300, "signalDbm": -70, "freqMhz": 2437})
+        self.assertEqual(wifi["suggestedKbps"], 35000)
+        self.assertEqual(len(wifi["notes"]), 2)
+        lossy = nettest.suggest([50.0, None, 80.0, 20.0], {"wireless": True, "linkMbps": 72, "signalDbm": -80})
+        self.assertEqual((lossy["verdict"], lossy["suggestedKbps"], lossy["delay"]), ("poor", 5000, "high"))
+        self.assertEqual((lossy["lossPct"], lossy["failed"], lossy["attempts"]), (25, 1, 4))
+        vpn = nettest.suggest([40.0, 41.0, 40.5], {"wireless": False, "vpn": True})
+        self.assertEqual((vpn["suggestedKbps"], vpn["remote"], vpn["verdict"]), (15000, True, "great"),
+                         "steady but far: smooth, with input lag, at a bitrate an upload carries")
+        none = nettest.suggest([None, None], {"wireless": False})
+        self.assertEqual((none["verdict"], none["suggestedKbps"]), ("unreachable", None))
+
+
+class TailscaleTests(unittest.TestCase):
+    def test_parse_status(self):
+        text = json.dumps({
+            "BackendState": "Running",
+            "Self": {"TailscaleIPs": ["100.64.0.2", "fd7a::2"]},
+            "Peer": {
+                "a": {"HostName": "gaming-pc", "TailscaleIPs": ["100.64.0.5"], "Online": True},
+                "b": {"DNSName": "laptop.tail.ts.net.", "TailscaleIPs": ["100.64.0.9"], "Online": False},
+                "c": {"HostName": "v6only", "TailscaleIPs": ["fd7a::9"], "Online": True},
+            },
+        })
+        status = tailscale.parse_status(text)
+        self.assertEqual(status["self"], "100.64.0.2")
+        self.assertEqual([(p["name"], p["online"]) for p in status["peers"]], [("gaming-pc", True), ("laptop", False)])
+        self.assertEqual(tailscale.parse_status("nope")["peers"], [])
+        stopped = tailscale.parse_status(json.dumps({"BackendState": "Stopped", "Self": {"TailscaleIPs": ["100.1.1.1"]}}))
+        self.assertIsNone(stopped["self"])
+
+
+class BatteryTests(unittest.TestCase):
+    def test_read_battery(self):
+        with tempfile.TemporaryDirectory() as root:
+            for name, values in (("AC", {"type": "Mains"}), ("BAT1", {"type": "Battery", "capacity": "42", "status": "Discharging"}),
+                                 ("hid-pad", {"type": "Battery", "scope": "Device", "capacity": "5", "status": "Discharging"})):
+                os.makedirs(os.path.join(root, name))
+                for key, value in values.items():
+                    open(os.path.join(root, name, key), "w").write(value + "\n")
+            self.assertEqual(battery.read(root), {"percent": 42, "charging": False})
+            self.assertIsNone(battery.read(os.path.join(root, "missing")))
+
+    def test_guard(self):
+        guard = battery.BatteryGuard()
+        low = {"percent": 19, "charging": False}
+        self.assertIsNone(guard.update(20, low, 0), "started below the level on purpose: left alone")
+        self.assertIsNone(guard.update(20, {"percent": 21, "charging": False}, 0), "not re-armed 1% above")
+        self.assertIsNone(guard.update(20, low, 0))
+        guard.reset()  # Sunshine stopped and started again
+        self.assertIsNone(guard.update(20, {"percent": 60, "charging": False}, 0))
+        self.assertEqual(guard.update(20, {"percent": 20, "charging": False}, 1), "warn")
+        self.assertIsNone(guard.update(20, low, 1), "warned once")
+        self.assertEqual(guard.update(20, {"percent": 5, "charging": False}, 1), "stop", "the floor ends the stream")
+        guard.reset()
+        guard.update(20, {"percent": 60, "charging": False}, 0)
+        self.assertEqual(guard.update(20, low, 0), "stop")
+        self.assertIsNone(guard.update(20, low, 0), "acts once per fall")
+        self.assertIsNone(guard.update(20, {"percent": 19, "charging": True}, 0))
+        self.assertEqual(guard.update(20, low, 0), "stop", "unplugged again below the level")
+        self.assertIsNone(guard.update(0, low, 0), "off")
+
+
+class PeerTests(unittest.TestCase):
+    def test_tcp_peers(self):
+        text = (
+            "  sl  local_address rem_address   st\n"
+            "   0: 0100007F:BB8D 0100007F:9C40 01\n"              # 127.0.0.1:47757 <- loopback
+            "   1: 2F02A8C0:BB70 0502A8C0:D431 01\n"              # 192.168.2.47:47984 <- .5
+            "   2: 2F02A8C0:BB70 0602A8C0:D432 06\n"              # TIME_WAIT: a finished exchange counts
+            "   4: 2F02A8C0:BB70 2F02A8C0:D433 01\n"              # this device itself
+            "   3: 2F02A8C0:9C40 0702A8C0:BB70 01\n"              # outgoing to a host's 47984
+        )
+        self.assertEqual(sunshine_session.tcp_peers(text, own=frozenset({"192.168.2.47"})), {"192.168.2.5", "192.168.2.6"})
+        self.assertEqual(sunshine_session.client_tcp_ports(47989), (47984, 47989, 48010))
+        mapped = "  sl local rem st\n   0: 0000000000000000FFFF00002F02A8C0:BB70 0000000000000000FFFF00000902A8C0:D000 01\n"
+        self.assertEqual(sunshine_session.tcp_peers(mapped), {"192.168.2.9"})
+
+    def test_tracker(self):
+        tracker = sunshine_session.PeerTracker()
+        self.assertEqual(tracker.update({"10.0.0.9"}, 0, 0.0), [], "seen long before the stream")
+        self.assertEqual(tracker.update({"10.0.0.5"}, 0, 50.0), [])
+        self.assertEqual(tracker.update(set(), 1, 60.0), ["10.0.0.5"], "only devices seen just before the start")
+        self.assertEqual(tracker.update({"10.0.0.6"}, 2, 70.0), ["10.0.0.5", "10.0.0.6"], "a second client joining")
+        self.assertEqual(tracker.update({"10.0.0.7"}, 2, 200.0), ["10.0.0.5", "10.0.0.6"], "later browsers are not added")
+        self.assertEqual(tracker.update(set(), 0, 210.0), [])
+
+
+class BackupTests(unittest.TestCase):
+    def test_roundtrip_without_passwords(self):
+        settings = json.loads(json.dumps(DEFAULTS))
+        settings["sunshine"]["password"] = "secret"
+        settings["hosts"] = {"h1": {"sunshineUser": "u", "sunshinePassword": "p", "preset": "p-1"}}
+        settings["profiles"] = {"p-1": {"name": "TV", "stream": {"fps": 60}}}
+        settings["shortcuts"]["launcherAppId"] = 123
+        with tempfile.TemporaryDirectory() as home:
+            media = os.path.join(home, "no-media")
+            data = backup.build(settings, {"max_bitrate": 20000}, [{"appId": 620, "name": "Portal 2"}], False, "0.2.0", now=0)
+            self.assertNotIn("password", data["settings"]["sunshine"])
+            self.assertNotIn("shortcuts", data["settings"])
+            path = backup.write(home, data, media_root=media)
+            second = backup.write(home, data, media_root=media)
+            self.assertNotEqual(path, second)
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+            with open(os.path.join(backup.backup_dir(home), "eclipse-backup (1).json"), "w") as fh:
+                fh.write("{oops")
+            listed = backup.list_backups(home, media_root=media)
+            self.assertEqual(listed[-1]["error"], "The backup file is damaged", "damaged files are listed last")
+            listed = listed[:-1]
+            self.assertEqual(len(listed), 2)
+            self.assertEqual((listed[0]["profiles"], listed[0]["games"], listed[0]["hasPasswords"]), (1, 1, False))
+            restored = backup.read(home, "home", os.path.basename(path), media_root=media)
+            current = json.loads(json.dumps(settings))
+            current["shortcuts"]["launcherAppId"] = 456
+            merged = backup.merge_settings(current, restored["settings"], DEFAULTS)
+            self.assertEqual(merged["sunshine"]["password"], "secret", "passwords not in the backup are kept")
+            self.assertEqual(merged["hosts"]["h1"]["sunshinePassword"], "p")
+            current["sunshine"]["user"] = "deck"
+            restored["settings"]["sunshine"]["user"] = "linh"
+            merged = backup.merge_settings(current, restored["settings"], DEFAULTS)
+            self.assertEqual((merged["sunshine"]["user"], merged["sunshine"]["password"]), ("deck", "secret"),
+                             "a kept password keeps its user name")
+            self.assertEqual(merged["shortcuts"]["launcherAppId"], 456, "local shortcuts are kept")
+            self.assertEqual(merged["profiles"]["p-1"]["name"], "TV")
+            with self.assertRaises(ValueError):
+                backup.read(home, "home", "../settings.json", media_root=media)
+            with self.assertRaises(ValueError):
+                backup.read(home, "/etc", "passwd.json", media_root=media)
+            backup.delete(home, "home", os.path.basename(second), media_root=media)
+            self.assertEqual(len(backup.list_backups(home, media_root=media)), 2)
+
+    def test_damaged_values_are_dropped_on_restore(self):
+        current = json.loads(json.dumps(DEFAULTS))
+        restored = {"sunshine": "oops", "features": [], "behavior": {"autoWake": "yes", "pollIntervalS": 5},
+                    "hosts": {"h1": "bad", "h2": {"preset": "x"}}, "profiles": {"p": {"name": 3}}}
+        merged = backup.merge_settings(current, restored, DEFAULTS)
+        self.assertNotIn("sunshine", merged)
+        self.assertEqual(merged["behavior"], {"pollIntervalS": 5})
+        self.assertEqual(merged["hosts"], {"h2": {"preset": "x"}})
+        self.assertEqual(merged["profiles"], {})
+
+    def test_removable_drives_are_locations(self):
+        with tempfile.TemporaryDirectory() as home:
+            self.assertEqual([loc["id"] for loc in backup.locations(home, os.path.join(home, "none"))], ["home"])
+
+    def test_invalid_backups(self):
+        for data in ({}, {"format": "eclipse-backup", "version": 99, "settings": {}}, {"format": "eclipse-backup", "version": 1}):
+            with self.assertRaises(ValueError):
+                backup.validate(data)
 
 
 if __name__ == "__main__":

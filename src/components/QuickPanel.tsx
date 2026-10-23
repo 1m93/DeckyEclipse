@@ -45,13 +45,14 @@ import {
   useStore,
   type QuickTab,
 } from "../lib/store";
-import { AUTO_OFF_OPTIONS, describeSunshine, repairReason, useSunshineStatus } from "../lib/sunshine";
+import { AUTO_OFF_OPTIONS, describeDevices, describeSunshine, repairReason, useSunshineStatus } from "../lib/sunshine";
 import type { PendingPairing, SunshineStatus } from "../types";
 import { showAddHostModal } from "./AddHostModal";
 import { ButtonRow } from "./ButtonRow";
 import { FeatureSetup, InstallSection } from "./FeatureSetup";
 import { HostRow } from "./HostRow";
 import { PlayIcon, ShareIcon } from "./icons";
+import { showNetworkTest } from "./NetworkTestModal";
 import { InstallProgress } from "./InstallProgress";
 import { ApplyOptionsRow, MAX_BITRATE_OPTIONS, maxBitrateLabel, withCurrent } from "./SunshineOptionsSections";
 import { showSunshinePinModal } from "./SunshinePinModal";
@@ -176,6 +177,17 @@ function OutgoingLive() {
           </ButtonItem>
         </PanelSectionRow>
       )}
+      {host && (
+        <PanelSectionRow>
+          <ButtonItem
+            layout="below"
+            description="Stuttering or lagging? Check the network."
+            onClick={() => showNetworkTest(host)}
+          >
+            Network test
+          </ButtonItem>
+        </PanelSectionRow>
+      )}
     </PanelSection>
   );
 }
@@ -188,7 +200,9 @@ function IncomingLive() {
   if (!incoming || incoming.clients === 0) return null;
 
   const devices = incoming.clients === 1 ? "A device is" : `${incoming.clients} devices are`;
-  const detail = [incoming.appName, incoming.since ? formatDuration(elapsed) : null].filter(Boolean).join(" · ");
+  const detail = [describeDevices(incoming.devices, incoming.clients), incoming.appName, incoming.since ? formatDuration(elapsed) : null]
+    .filter(Boolean)
+    .join(" · ");
   return (
     <PanelSection title="Sharing">
       <PanelSectionRow>
@@ -561,6 +575,15 @@ function QuickShareOptions({ visible, running }: { visible: boolean; running: bo
         />
       </PanelSectionRow>
       <PanelSectionRow>
+        <ButtonItem
+          layout="below"
+          description="Steam games other devices can start directly from Moonlight."
+          onClick={() => openEclipsePage("sunshine")}
+        >
+          Choose games...
+        </ButtonItem>
+      </PanelSectionRow>
+      <PanelSectionRow>
         <ButtonItem layout="below" onClick={() => openEclipsePage("sunshine")}>
           All sharing settings
         </ButtonItem>
@@ -710,7 +733,9 @@ function ShareTab({ visible }: { visible: boolean }) {
               description={
                 sharing && !sharing.address
                   ? "Connect to the same Wi-Fi or LAN as the other device."
-                  : "The other device needs Moonlight. On the same network it finds this device on its own; if not, add this address in Moonlight."
+                  : `The other device needs Moonlight. On the same network it finds this device on its own; if not, add this address in Moonlight.${
+                      sharing?.remoteAddress ? ` Away from home (Tailscale): ${sharing.remoteAddress}.` : ""
+                    }`
               }
               bottomSeparator="none"
             />

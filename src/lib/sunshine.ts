@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { backend } from "../backend";
-import type { SunshineAutoOff, SunshineStatus } from "../types";
+import type { StreamingDevice, SunshineAutoOff, SunshineBatteryGuard, SunshineStatus } from "../types";
 import { notify, setSunshineAutostart } from "./actions";
 import { refreshIncoming, useStore } from "./store";
 
@@ -157,3 +157,21 @@ export const AUTO_OFF_OPTIONS: { data: SunshineAutoOff; label: string }[] = [
   { data: "30", label: "30 min idle" },
   { data: "60", label: "1 h idle" },
 ];
+
+export const BATTERY_GUARD_OPTIONS: { data: SunshineBatteryGuard; label: string }[] = [
+  { data: "off", label: "Never" },
+  { data: "10", label: "At 10 %" },
+  { data: "20", label: "At 20 %" },
+  { data: "30", label: "At 30 %" },
+];
+
+/**
+ * Who streams, as far as the network shows: "From Phone (192.168.1.5)". The
+ * guess is hedged when it lists more devices than are streaming. Null when unknown.
+ */
+export function describeDevices(devices: StreamingDevice[] | undefined, clients = devices?.length ?? 0): string | null {
+  if (!devices?.length || clients <= 0) return null;
+  const names = devices.map((d) => (d.name ? `${d.name} (${d.address})` : `a device at ${d.address}`));
+  const list = names.join(", ");
+  return devices.length > clients ? `Probably from ${list}` : `From ${list}`;
+}

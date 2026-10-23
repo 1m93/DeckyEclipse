@@ -9,6 +9,7 @@ import {
 } from "@decky/ui";
 import { backend } from "../backend";
 import { AppsSection } from "../components/AppsSection";
+import { BackupSection } from "../components/BackupSection";
 import { CommitTextField } from "../components/CommitTextField";
 import { notify, saveFeatures } from "../lib/actions";
 import { isShortcutPresent, recreateLauncherShortcut } from "../lib/steam";
@@ -184,6 +185,8 @@ export function GeneralPage() {
       )}
 
       {features.moonlight && <MoonlightSettings settings={settings} />}
+
+      <BackupSection />
     </>
   );
 }

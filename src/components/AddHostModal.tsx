@@ -12,6 +12,8 @@ import {
 } from "@decky/ui";
 import { useCallback, useEffect, useState } from "react";
 import { backend } from "../backend";
+import { notify } from "../lib/actions";
+import { setState } from "../lib/store";
 import type { DiscoveredHost } from "../types";
 import { ButtonRow } from "./ButtonRow";
 import { showPairModal } from "./PairModal";
@@ -23,6 +25,28 @@ import { showPairModal } from "./PairModal";
 function AddHostModal({ closeModal }: { closeModal?: () => void }) {
   const [found, setFound] = useState<DiscoveredHost[] | null>(null);
   const [scanError, setScanError] = useState<string | null>(null);
+  const [tailscale, setTailscale] = useState<"running" | "stopped" | "missing" | null>(null);
+  const [saving, setSaving] = useState<string | null>(null);
+
+  /** A host already added, found at a new address (e.g. Tailscale): remember it to reach the host there. */
+  const saveAddress = async (pc: DiscoveredHost) => {
+    if (!pc.uuid) return;
+    setSaving(pc.address);
+    try {
+      const res = await backend.addHostAddress(pc.uuid, pc.address);
+      if (res.ok && res.settings) setState({ settings: res.settings });
+      notify(
+        res.ok
+          ? `${pc.name} can now also be reached at ${pc.address}, e.g. away from home.`
+          : (res.error ?? "Could not save the address"),
+      );
+      if (res.ok) closeModal?.();
+    } catch (err) {
+      notify(`Could not save the address: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setSaving(null);
+    }
+  };
   const [address, setAddress] = useState("");
   const [withLogin, setWithLogin] = useState(false);
   const [user, setUser] = useState("");
@@ -34,7 +58,8 @@ function AddHostModal({ closeModal }: { closeModal?: () => void }) {
     try {
       const res = await backend.discoverHosts();
       setFound(res.items);
-      if (!res.scanned) setScanError("This device is not connected to a network.");
+      setTailscale(res.tailscale);
+      if (!res.scanned && res.items.length === 0) setScanError("This device is not connected to a network.");
     } catch (err) {
       setFound([]);
       setScanError(err instanceof Error ? err.message : String(err));
@@ -62,27 +87,39 @@ function AddHostModal({ closeModal }: { closeModal?: () => void }) {
           {found === null ? (
             <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "6px 0" }}>
               <Spinner style={{ width: 20, height: 20 }} />
-              Looking for PCs on your network...
+              Looking for PCs on your network{tailscale === "running" ? " and Tailscale" : ""}...
             </div>
           ) : (
             <Focusable style={{ display: "flex", flexDirection: "column", gap: 6 }} flow-children="column">
               {found.map((pc) => (
                 <DialogButton
                   key={pc.address}
-                  disabled={pc.known}
+                  disabled={(pc.known && !pc.newAddress) || saving !== null}
                   style={{ textAlign: "left" }}
-                  onClick={() => pair(pc.address)}
+                  onClick={() => (pc.known && pc.newAddress && pc.uuid ? void saveAddress(pc) : pair(pc.address))}
                 >
                   {pc.name}
                   <span style={{ opacity: 0.6, marginLeft: 8 }}>
                     {pc.address}
-                    {pc.known ? " · already added" : ""}
+                    {pc.via === "tailscale" ? " · via Tailscale" : ""}
+                    {pc.known
+                      ? pc.newAddress
+                        ? saving === pc.address
+                          ? " · saving..."
+                          : " · added: press to also reach it at this address"
+                        : " · already added"
+                      : ""}
                   </span>
                 </DialogButton>
               ))}
               {found.length === 0 && (
                 <div style={{ opacity: 0.7 }}>
                   {scanError ?? "No PC found. Check that Sunshine runs on it and that it is on the same network."}
+                </div>
+              )}
+              {tailscale === "stopped" && (
+                <div style={{ opacity: 0.7 }}>
+                  Tailscale is installed but not connected, so PCs away from home are not listed.
                 </div>
               )}
               <DialogButton onClick={() => void scan()}>Search again</DialogButton>

@@ -17,6 +17,7 @@ import { showAppPicker } from "../components/AppPickerModal";
 import { ButtonRow } from "../components/ButtonRow";
 import { CommitTextField } from "../components/CommitTextField";
 import { MonitorsSection, showSunshineLogin } from "../components/MonitorsSection";
+import { showNetworkTest } from "../components/NetworkTestModal";
 import { showPairModal } from "../components/PairModal";
 import { StatusDot } from "../components/StatusDot";
 import { notify, wakeHost } from "../lib/actions";
@@ -118,6 +119,13 @@ function HostDetails({ host }: { host: Host }) {
             { label: "Pair again", onClick: () => showPairModal({ address: "", host }) },
           ]}
         />
+        <ButtonItem
+          layout="below"
+          description="Measures delay and stability to this host and this device's link, and suggests a bitrate. For a stuttering stream."
+          onClick={() => showNetworkTest(host)}
+        >
+          Network test
+        </ButtonItem>
       </DialogControlsSection>
 
       <DialogControlsSection>

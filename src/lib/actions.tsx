@@ -397,7 +397,7 @@ export function restartSunshineToApply(): void {
       // A change still being saved must be in the file before Sunshine reads it.
       await optionsQueue;
       const res = await backend.sunshineRestart();
-      notify(res.ok ? "Sunshine restarted with the new options." : (res.error ?? "Could not restart Sunshine"));
+      notify(res.ok ? "Sunshine restarted: the changes are applied." : (res.error ?? "Could not restart Sunshine"));
     } catch (err) {
       notify(`Could not restart Sunshine: ${errorText(err)}`);
     } finally {

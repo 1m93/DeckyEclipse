@@ -110,8 +110,11 @@ def _check(check_id: str, label: str, ok: Optional[bool], detail: str = "", hint
     return {"id": check_id, "label": label, "ok": ok, "detail": detail, "hint": hint if ok is not True else ""}
 
 
-async def run(status: dict[str, Any], home: str) -> dict[str, Any]:
-    """Run all checks concurrently. ``status`` is LocalSunshine.status()."""
+async def run(status: dict[str, Any], home: str, announced: bool = False) -> dict[str, Any]:
+    """Run all checks concurrently. ``status`` is LocalSunshine.status().
+
+    ``announced``: Eclipse answers mDNS for Sunshine, which could not publish itself.
+    """
     server, web, avahi, firewalld, ufw, ips = await asyncio.gather(
         network.probe("127.0.0.1", DEFAULT_HTTP_PORT, 2.0),
         _tcp_open("127.0.0.1", DEFAULT_SUNSHINE_WEB_PORT),
@@ -159,6 +162,9 @@ async def run(status: dict[str, Any], home: str) -> dict[str, Any]:
             hint="Connect this device to the same Wi-Fi or LAN as the other device.",
         ),
         _check(
+            "discovery", "Automatic discovery", True,
+            detail="Announced by Eclipse, because Sunshine could not announce itself through avahi-daemon.",
+        ) if announced else _check(
             "discovery", "Automatic discovery (avahi-daemon)", avahi,
             detail="Running" if avahi else "",
             hint=(

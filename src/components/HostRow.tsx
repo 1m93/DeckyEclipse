@@ -7,6 +7,7 @@ import { openEclipsePage } from "../lib/navigation";
 import { useStore } from "../lib/store";
 import type { Host, HostStatus } from "../types";
 import { showAppPicker } from "./AppPickerModal";
+import { showNetworkTest } from "./NetworkTestModal";
 import { showPairModal } from "./PairModal";
 import { StatusDot } from "./StatusDot";
 
@@ -18,6 +19,7 @@ function showHostMenu(host: Host, lastApp: string | undefined, canWake: boolean,
       {canWake && <MenuItem onClick={() => void wakeHost(host)}>Wake (Wake-on-LAN)</MenuItem>}
       {busy && <MenuItem onClick={() => void quitHostApp(host)}>Quit running app</MenuItem>}
       <MenuSeparator />
+      <MenuItem onClick={() => showNetworkTest(host)}>Network test</MenuItem>
       <MenuItem onClick={() => showPairModal({ address: "", host })}>Pair again</MenuItem>
       <MenuItem onClick={() => openEclipsePage("streaming", host.uuid)}>Host settings</MenuItem>
     </Menu>,

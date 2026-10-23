@@ -7,6 +7,7 @@ import base64
 import os
 import re
 import secrets
+import socket
 import sys
 import time
 from typing import Any, Optional
@@ -16,15 +17,16 @@ import decky
 # Decky adds py_modules to sys.path for us, but keep this for local tooling.
 sys.path.insert(0, os.path.join(decky.DECKY_PLUGIN_DIR, "py_modules"))
 
-from eclipse import LAUNCHER_LOG, SETTINGS_FILE  # noqa: E402
+from eclipse import DEFAULT_HTTP_PORT, LAUNCHER_LOG, SETTINGS_FILE  # noqa: E402
 from eclipse import FLATPAK_MOONLIGHT, FLATPAK_SUNSHINE  # noqa: E402
 from eclipse import diagnostics, display, flatpak, host_display, launch, moonlight, network, updates  # noqa: E402
 from eclipse import proc, sunshine_config, sunshine_data, sunshine_native  # noqa: E402
-from eclipse.sunshine_session import AutoOff, SessionTracker  # noqa: E402
+from eclipse import backup, battery, mdns, nettest, sunshine_apps, tailscale  # noqa: E402
+from eclipse.sunshine_session import AutoOff, PeerTracker, SessionTracker, client_tcp_ports, read_tcp_peers  # noqa: E402
 from eclipse.log import set_logger  # noqa: E402
 from eclipse.moonlight_config import MoonlightConfig, find_boxart  # noqa: E402
 from eclipse.presets import AUTO_PRESET, CUSTOM_PRESET, INHERIT_PRESET, all_presets, effective_stream  # noqa: E402
-from eclipse.settings import SettingsStore  # noqa: E402
+from eclipse.settings import DEFAULTS as DEFAULT_SETTINGS, SettingsStore  # noqa: E402
 from eclipse.sunshine import LocalSunshine, SunshineApi, pair_client  # noqa: E402
 
 set_logger(decky.logger)
@@ -42,6 +44,15 @@ SESSION_EVENT = "eclipse_sunshine_session"
 # Probes in a row Sunshine must miss before it counts as stopped.
 SESSION_MISSES_OFFLINE = 2
 AUTO_OFF_EVENT = "eclipse_sunshine_auto_off"
+# How often Sunshine's log is checked for a failed mDNS publication, and how
+# long to wait before trying to announce again after the responder failed.
+MDNS_CHECK_S = 20.0
+MDNS_RETRY_S = 60.0
+# LAN addresses change rarely (Wi-Fi switch): re-read them at most this often.
+ADDRESSES_CACHE_S = 30.0
+# Reverse DNS names of streaming devices, also when unknown.
+PEER_NAME_CACHE_S = 600.0
+PEER_NAME_TIMEOUT_S = 2.0
 # Block elements flatpak uses to draw progress bars.
 _BAR_CHARS = re.compile(r"[\u2580-\u259f]+")
 
@@ -80,6 +91,17 @@ class Plugin:
     _auto_off: AutoOff
     # mtime of Sunshine's state file when duplicate paired devices were last looked for.
     _state_checked: float
+    _mdns: Optional[mdns.Responder]
+    # (checked at, Sunshine failed to publish) from its log.
+    _mdns_failed: tuple[float, bool]
+    _mdns_retry_at: float
+    # The last attempt to announce failed (e.g. UDP 5353 unavailable).
+    _mdns_failed_start: bool
+    _addresses: tuple[float, list[dict[str, str]]]
+    _peers: PeerTracker
+    # Reverse DNS names of streaming devices: address -> (looked up at, name).
+    _peer_names: dict[str, tuple[float, Optional[str]]]
+    _battery_guard: battery.BatteryGuard
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -106,6 +128,14 @@ class Plugin:
         self._session_misses = 0
         self._auto_off = AutoOff()
         self._state_checked = 0.0
+        self._mdns = None
+        self._mdns_failed = (float("-inf"), False)
+        self._mdns_retry_at = 0.0
+        self._mdns_failed_start = False
+        self._addresses = (float("-inf"), [])
+        self._peers = PeerTracker()
+        self._peer_names = {}
+        self._battery_guard = battery.BatteryGuard()
         log.info("Eclipse backend started (home=%s)", home)
 
         features = self.settings.data["features"]
@@ -116,6 +146,9 @@ class Plugin:
     async def _unload(self) -> None:
         for task in list(self._tasks):
             task.cancel()
+        if self._mdns:
+            await self._mdns.stop()
+            self._mdns = None
         log.info("Eclipse backend unloaded")
 
     async def _uninstall(self) -> None:
@@ -176,6 +209,24 @@ class Plugin:
             return None
         return SunshineApi(target, cfg["sunshineUser"], cfg["sunshinePassword"], int(cfg.get("sunshinePort") or 0))
 
+    def _host_addresses(self, host: dict[str, Any]) -> list[dict[str, Any]]:
+        """Moonlight's addresses of a host plus the ones saved in Eclipse (e.g. its Tailscale address)."""
+        known = {a["address"] for a in host["addresses"]}
+        extra = [
+            {"kind": "extra", "address": a, "port": DEFAULT_HTTP_PORT}
+            for a in self._host_cfg(host["uuid"]).get("extraAddresses") or []
+            if isinstance(a, str) and a not in known
+        ]
+        return [*host["addresses"], *extra]
+
+    def _moonlight_target(self, host: dict[str, Any], status: Optional[dict[str, Any]]) -> str:
+        """What to give Moonlight for a host: its name, or the reachable address when Moonlight does
+        not know that address yet (Moonlight then adds it to the host, matched by its id)."""
+        address = (status or {}).get("address")
+        if address and address not in {a["address"] for a in host["addresses"]}:
+            return str(address)
+        return host["name"]
+
     def _best_address(self, host: dict[str, Any]) -> Optional[str]:
         cached = self._probe_cache.get(host["uuid"]) or {}
         if cached.get("address"):
@@ -228,7 +279,7 @@ class Plugin:
             if not force and time.monotonic() - self._probe_at < PROBE_CACHE_S:
                 return self._probe_cache
             hosts = self._hosts()
-            results = await asyncio.gather(*(network.probe_any(h["addresses"]) for h in hosts))
+            results = await asyncio.gather(*(network.probe_any(self._host_addresses(h)) for h in hosts))
             cache: dict[str, Any] = {}
             for host, info in zip(hosts, results):
                 previous = self._probe_cache.get(host["uuid"]) or {}
@@ -279,7 +330,7 @@ class Plugin:
         while time.monotonic() < deadline:
             await asyncio.to_thread(network.send_wol, mac, hints)
             await self._emit("eclipse_wake_progress", host["uuid"], int(time.monotonic() - started), int(timeout))
-            if await network.probe_any(host["addresses"], 2.0):
+            if await network.probe_any(self._host_addresses(host), 2.0):
                 return True
             await asyncio.sleep(2)
         return False
@@ -296,7 +347,7 @@ class Plugin:
             return {"ok": False, "error": resolved.get("error") or "Moonlight is not installed"}
 
         behavior = self.settings.data["behavior"]
-        status = await network.probe_any(host["addresses"])
+        status = await network.probe_any(self._host_addresses(host))
         if not status:
             mac = self._host_mac(host)
             if behavior.get("autoWake") and mac:
@@ -318,7 +369,7 @@ class Plugin:
 
         launch.write_request(decky.DECKY_PLUGIN_SETTINGS_DIR, {
             "action": "stream",
-            "host": host["name"],
+            "host": self._moonlight_target(host, status or await network.probe_any(self._host_addresses(host))),
             "hostUuid": uuid,
             "app": app_name,
         })
@@ -394,7 +445,8 @@ class Plugin:
             if result["ok"]:
                 return {"ok": True, "launch": False, "error": None}
             log.info("Sunshine close failed (%s), falling back to Moonlight", result["error"])
-        launch.write_request(decky.DECKY_PLUGIN_SETTINGS_DIR, {"action": "quit", "host": host["name"]})
+        status = await network.probe_any(self._host_addresses(host))
+        launch.write_request(decky.DECKY_PLUGIN_SETTINGS_DIR, {"action": "quit", "host": self._moonlight_target(host, status)})
         return {"ok": True, "launch": True, "error": None}
 
     async def quit_after_stream(self, uuid: str) -> dict[str, Any]:
@@ -413,7 +465,7 @@ class Plugin:
 
         for _ in range(3):
             await asyncio.sleep(2)
-            status = await network.probe_any(host["addresses"])
+            status = await network.probe_any(self._host_addresses(host))
             if not status or not status.get("busy"):
                 return {"ok": True, "launch": False, "error": None}
         log.info("An app is still open on %s after the stream, quitting it", host["name"])
@@ -428,8 +480,20 @@ class Plugin:
             entry for entry in await diagnostics.local_ipv4(decky.DECKY_USER_HOME)
             if not entry["interface"].startswith(diagnostics.VIRTUAL_IFACES)
         ]
-        found = await network.discover(local[:2])
-        known = {host["uuid"] for host in self._hosts()}
+        ts = await tailscale.status(decky.DECKY_USER_HOME)
+        ts_peers = [p for p in ts["peers"] if p["online"]] if ts["running"] else []
+        found, remote = await asyncio.gather(
+            network.discover(local[:2]),
+            asyncio.gather(*(network.probe(p["address"], 47989, timeout=1.5) for p in ts_peers)),
+        )
+        lan_ids = {info.get("uniqueId") for info in found}
+        for info in remote:
+            # A PC on the LAN is listed once, by its LAN address.
+            if info and (not info.get("uniqueId") or info.get("uniqueId") not in lan_ids):
+                found.append({**info, "via": "tailscale"})
+        hosts = self._hosts()
+        known = {host["uuid"] for host in hosts}
+        addresses_of = {host["uuid"]: {a["address"] for a in self._host_addresses(host)} for host in hosts}
         own_ids = set()
         if self.settings.data["features"].get("sunshine"):
             web_port = int(self.settings.data["sunshine"].get("port") or 47990)
@@ -441,11 +505,52 @@ class Plugin:
                 "address": info["address"],
                 "name": info.get("hostname") or info["address"],
                 "known": info.get("uniqueId") in known,
+                "uuid": info.get("uniqueId") if info.get("uniqueId") in known else None,
+                # Known, but not at this address yet: it can be saved as another way to reach it.
+                "newAddress": info.get("uniqueId") in known and info["address"] not in addresses_of.get(info.get("uniqueId"), set()),
+                "via": info.get("via", "lan"),
             }
             for info in found
             if info.get("uniqueId") not in own_ids
         ]
-        return {"ok": True, "error": None, "items": items, "scanned": bool(local)}
+        return {
+            "ok": True,
+            "error": None,
+            "items": items,
+            "scanned": bool(local),
+            "tailscale": "running" if ts["running"] else "stopped" if ts["installed"] else "missing",
+        }
+
+    async def add_host_address(self, uuid: str, address: str) -> dict[str, Any]:
+        """Save another address of a paired host (e.g. its Tailscale address) to reach it away from home."""
+        host = self._find_host(uuid)
+        if not host:
+            return {"ok": False, "error": "Unknown host"}
+        info = await network.probe(str(address), DEFAULT_HTTP_PORT, timeout=2.0)
+        if not info or info.get("uniqueId") != uuid:
+            return {"ok": False, "error": f"{address} is not {host['name']}, or it does not answer."}
+        extra = [a for a in self._host_cfg(uuid).get("extraAddresses") or [] if a != address]
+        self.settings.update({"hosts": {uuid: {"extraAddresses": [*extra, str(address)][-4:]}}})
+        self._probe_at = float("-inf")
+        return {"ok": True, "error": None, "settings": self.settings.public()}
+
+    async def host_network_test(self, uuid: str) -> dict[str, Any]:
+        """Latency, jitter and the link to a host, with the bitrate it suits."""
+        host = self._find_host(uuid)
+        if not host:
+            return {"ok": False, "error": "Unknown host"}
+        probe = await network.probe_any(self._host_addresses(host))
+        if not probe:
+            known = ", ".join(a["address"] for a in self._host_addresses(host)) or "none"
+            return {
+                "ok": False,
+                "error": f"{host['name']} does not answer at its known addresses ({known}). At home: wake it or check "
+                "that Sunshine runs. Away from home: add its Tailscale address in Add a host.",
+            }
+        address = probe.get("address") or self._best_address(host)
+        port = int(probe.get("port") or 47989)
+        result = await nettest.run(address, port, decky.DECKY_USER_HOME)
+        return {"ok": True, "error": None, **result}
 
     async def detect_host_displays(self, uuid: str) -> dict[str, Any]:
         """List the host's displays from its Sunshine log (needs credentials)."""
@@ -513,7 +618,7 @@ class Plugin:
             return {"ok": False, "error": "Unknown host", "checks": []}
         api = self._sunshine_api_for(host)
         info, local, resolved = await asyncio.gather(
-            network.probe_any(host["addresses"], timeout=2.0),
+            network.probe_any(self._host_addresses(host), timeout=2.0),
             diagnostics.local_ipv4(decky.DECKY_USER_HOME),
             self._resolve_moonlight(force=True),
         )
@@ -858,8 +963,38 @@ class Plugin:
                     return self._session_last
             log_path = diagnostics.sunshine_log_path(decky.DECKY_USER_HOME)
             state = await asyncio.to_thread(self._sessions.update, server, log_path)
+            if server:
+                own = frozenset(a["address"] for a in await self._lan_addresses())
+                peers = await asyncio.to_thread(read_tcp_peers, client_tcp_ports(web_port - 1), own)
+            else:
+                peers = set()
+            addresses = self._peers.update(peers, state["clients"], time.monotonic())
+            state["devices"] = [{"address": a, "name": self._peer_name(a)} for a in addresses]
             self._session_last = state
             return state
+
+    def _peer_name(self, address: str) -> Optional[str]:
+        """Name of a device from reverse DNS; looked up in the background, None until known."""
+        now = time.monotonic()
+        cached = self._peer_names.get(address)
+        if cached and now - cached[0] < PEER_NAME_CACHE_S:
+            return cached[1]
+        # Marks the lookup as running, so it is started once.
+        self._peer_names[address] = (now, cached[1] if cached else None)
+        if len(self._peer_names) > 64:
+            oldest = min(self._peer_names, key=lambda a: self._peer_names[a][0])
+            self._peer_names.pop(oldest, None)
+        self._spawn(self._lookup_peer_name(address))
+        return cached[1] if cached else None
+
+    async def _lookup_peer_name(self, address: str) -> None:
+        try:
+            host, _, _ = await asyncio.wait_for(asyncio.to_thread(socket.gethostbyaddr, address), PEER_NAME_TIMEOUT_S)
+        except (OSError, asyncio.TimeoutError):
+            return
+        # "Phone.lan" -> "Phone"; an address echoed back is no name.
+        name = host.split(".")[0] if host and not host.replace(".", "").isdigit() else None
+        self._peer_names[address] = (time.monotonic(), name)
 
     async def _watch_sunshine_sessions(self) -> None:
         """Tell the frontend when a device starts or stops streaming from here, even with the UI closed."""
@@ -868,15 +1003,21 @@ class Plugin:
             enabled = bool(self.settings.data["features"].get("sunshine"))
             try:
                 state = await self._session_state() if enabled else None
-                key = (state["clients"], state["appOpen"], state["appName"], state["reachable"]) if state else None
+                key = (
+                    (state["clients"], state["appOpen"], state["appName"], state["reachable"],
+                     tuple((d["address"], d["name"]) for d in state.get("devices", [])))
+                    if state else None
+                )
                 if key != last:
                     last = key
                     if state:
                         await self._emit(SESSION_EVENT, state)
                 if state:
                     await self._apply_auto_off(state)
+                    await self._apply_battery_guard(state)
                     if state["reachable"]:
                         await self._drop_duplicate_clients()
+                await self._sync_mdns(state)
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 - the watcher must keep running
@@ -922,6 +1063,96 @@ class Plugin:
         if result["ok"]:
             await self._emit(AUTO_OFF_EVENT, f"Sunshine turned off: {reason}.")
 
+    async def _apply_battery_guard(self, state: dict[str, Any]) -> None:
+        option = str(self.settings.data["sunshine"].get("batteryGuard") or "off")
+        level = int(option) if option.isdigit() else 0
+        if not state["reachable"]:
+            self._battery_guard.reset()
+            return
+        if self._installing:
+            return
+        info = await asyncio.to_thread(battery.read)
+        action = self._battery_guard.update(level, info, state["clients"])
+        if not action or not info:
+            return
+        percent = info["percent"]
+        if action == "warn":
+            await self._emit(AUTO_OFF_EVENT, f"Battery at {percent}%: Sunshine turns off when this stream ends, or at {battery.FLOOR_PERCENT}%.")
+            return
+        log.info("Turning Sunshine off: battery at %s%%", percent)
+        self._auto_off.reset()
+        result = await self.local_sunshine.stop()
+        if result["ok"]:
+            await self._emit(AUTO_OFF_EVENT, f"Sunshine turned off: battery at {percent}%.")
+
+    async def _lan_addresses(self) -> list[dict[str, str]]:
+        """Physical LAN IPv4 addresses of this device (cached briefly)."""
+        at, cached = self._addresses
+        if time.monotonic() - at < ADDRESSES_CACHE_S:
+            return cached
+        found = [
+            entry for entry in await diagnostics.local_ipv4(decky.DECKY_USER_HOME)
+            if not entry["interface"].startswith(diagnostics.VIRTUAL_IFACES)
+        ]
+        self._addresses = (time.monotonic(), found)
+        return found
+
+    async def _sunshine_publish_failed(self) -> bool:
+        at, failed = self._mdns_failed
+        if time.monotonic() - at < MDNS_CHECK_S:
+            return failed
+        path = diagnostics.sunshine_log_path(decky.DECKY_USER_HOME)
+        # Sunshine rewrites its log at every start and publishes right away: the start of the file tells.
+        text = await asyncio.to_thread(_head, path, 256 * 1024) if path else ""
+        failed = mdns.publish_failed(text)
+        self._mdns_failed = (time.monotonic(), failed)
+        return failed
+
+    async def _mdns_service(self) -> Optional[mdns.Service]:
+        addresses = tuple(entry["address"] for entry in await self._lan_addresses())
+        if not addresses:
+            return None
+        try:
+            options = await self.local_sunshine.read_options()
+        except OSError:
+            options = {}
+        hostname = socket.gethostname()
+        web_port = int(self.settings.data["sunshine"].get("port") or 47990)
+        return mdns.Service(
+            instance=mdns.instance_label(str(options.get("sunshine_name") or hostname)),
+            # A name of its own: avahi may already publish the plain host name.
+            host=mdns.dns_label(f"{hostname}-sunshine"),
+            port=web_port - 1,
+            addresses=addresses,
+        )
+
+    async def _sync_mdns(self, state: Optional[dict[str, Any]]) -> None:
+        """Announce Sunshine over mDNS while it runs and could not do so itself."""
+        wanted = (
+            bool(state and state["reachable"])
+            and bool(self.settings.data["sunshine"].get("announce", True))
+            and await self._sunshine_publish_failed()
+        )
+        service = await self._mdns_service() if wanted else None
+        if not wanted:
+            self._mdns_failed_start = False
+        if self._mdns and self._mdns.service != service:
+            await self._mdns.stop()
+            self._mdns = None
+        if not service or self._mdns or time.monotonic() < self._mdns_retry_at:
+            return
+        responder = mdns.Responder(service)
+        try:
+            service.records()  # A name that cannot be encoded fails here, not on every query.
+            await responder.start()
+        except (OSError, ValueError) as exc:
+            log.warning("mDNS: cannot announce Sunshine: %s", exc)
+            self._mdns_retry_at = time.monotonic() + MDNS_RETRY_S
+            self._mdns_failed_start = True
+            return
+        self._mdns = responder
+        self._mdns_failed_start = False
+
     async def sunshine_session(self) -> dict[str, Any]:
         return await self._session_state()
 
@@ -954,7 +1185,30 @@ class Plugin:
             clients = await api.clients()
             if clients["ok"]:
                 paired = len(clients["items"])
-        return {"address": addresses[0]["address"] if addresses else None, "paired": paired}
+        ts = await tailscale.status(decky.DECKY_USER_HOME)
+        return {
+            "address": addresses[0]["address"] if addresses else None,
+            "paired": paired,
+            "remoteAddress": ts["self"],
+            "announced": self._mdns is not None,
+            "announce": await self._announce_state(),
+        }
+
+    async def _announce_state(self) -> str:
+        """How other devices find this one: "active" (Eclipse announces it), "notNeeded" (Sunshine
+        does it), "failed" (Eclipse could not either), "off" (turned off) or "unknown"."""
+        if self._mdns is not None:
+            return "active"
+        if not self.settings.data["sunshine"].get("announce", True):
+            return "off"
+        if not (self._session_last or {}).get("reachable"):
+            return "unknown"
+        path = diagnostics.sunshine_log_path(decky.DECKY_USER_HOME)
+        text = await asyncio.to_thread(_head, path, 256 * 1024) if path else ""
+        if not mdns.publish_failed(text):
+            # Sunshine logs its own announcement once it is set up.
+            return "notNeeded" if "successfully established" in text else "unknown"
+        return "failed" if self._mdns_failed_start else "unknown"
 
     async def sunshine_status(self) -> dict[str, Any]:
         status = await self.local_sunshine.status()
@@ -1008,6 +1262,187 @@ class Plugin:
         """Restart Sunshine so changed options apply. Ends every stream from this device."""
         return await self.local_sunshine.restart()
 
+    # ------------------------------------------------------------------ Steam games in Sunshine
+
+    async def _editable_sunshine(self) -> tuple[Optional[str], dict[str, Any]]:
+        """Sunshine's config dir and status, or an error text when its files cannot be changed now."""
+        status = await self.local_sunshine.status()
+        if not status["installed"]:
+            return "Sunshine is not installed", status
+        if (status.get("native") or {}).get("legacy"):
+            return "Repair Sunshine first: this copy keeps its config in the wrong folder.", status
+        return None, status
+
+    async def sunshine_games(self) -> dict[str, Any]:
+        """Installed Steam games and the apps Sunshine offers to other devices."""
+        error, _ = await self._editable_sunshine()
+        if error:
+            return {"ok": False, "error": error, "games": [], "apps": []}
+        config_dir = await self.local_sunshine.config_dir()
+        try:
+            games, apps = await asyncio.gather(
+                asyncio.to_thread(sunshine_apps.installed_games, decky.DECKY_USER_HOME),
+                asyncio.to_thread(sunshine_apps.list_apps, config_dir),
+            )
+        except (OSError, ValueError) as exc:
+            return {"ok": False, "error": str(exc), "games": [], "apps": []}
+        return {"ok": True, "error": None, "games": games, "apps": apps,
+                "needsRestart": self.local_sunshine.config_pending}
+
+    async def sunshine_game_cover(self, app_id: int) -> dict[str, Any]:
+        """The cover of a Steam game as Steam caches it (usually JPEG), for the frontend to convert."""
+        path = await asyncio.to_thread(sunshine_apps.cover_source, decky.DECKY_USER_HOME, int(app_id))
+        if not path:
+            return {"ok": False, "error": "No cover in Steam's cache"}
+        try:
+            return {"ok": True, "error": None, **await asyncio.to_thread(sunshine_apps.read_cover, path)}
+        except (OSError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+
+    async def sunshine_save_game_cover(self, app_id: int, png_base64: str) -> dict[str, Any]:
+        config_dir = await self.local_sunshine.config_dir()
+        try:
+            await asyncio.to_thread(sunshine_apps.save_cover, config_dir, int(app_id), png_base64)
+        except (OSError, ValueError) as exc:
+            return {"ok": False, "error": f"Could not save the cover: {exc}"}
+        return {"ok": True, "error": None}
+
+    async def sunshine_add_games(self, games: list[dict[str, Any]]) -> dict[str, Any]:
+        """Offer these Steam games (``{"appId", "name"}``) to other devices."""
+        error, status = await self._editable_sunshine()
+        if error:
+            return {"ok": False, "error": error}
+        config_dir = await self.local_sunshine.config_dir()
+        try:
+            added = await asyncio.to_thread(
+                sunshine_apps.add_games, config_dir, list(games or []), await self.local_sunshine.is_flatpak()
+            )
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            return {"ok": False, "error": f"Could not change Sunshine's app list: {exc}"}
+        if added:
+            self.local_sunshine.mark_changed(status["running"])
+            # The open app's name is matched against apps.json: drop what was cached.
+            self._sessions = SessionTracker()
+        return {"ok": True, "error": None, "added": added,
+                "needsRestart": status["running"] and self.local_sunshine.config_pending}
+
+    async def sunshine_remove_games(self, app_ids: list[int]) -> dict[str, Any]:
+        error, status = await self._editable_sunshine()
+        if error:
+            return {"ok": False, "error": error}
+        config_dir = await self.local_sunshine.config_dir()
+        try:
+            removed = await asyncio.to_thread(sunshine_apps.remove_games, config_dir, [int(i) for i in app_ids or []])
+        except (OSError, ValueError, TypeError) as exc:
+            return {"ok": False, "error": f"Could not change Sunshine's app list: {exc}"}
+        if removed:
+            self.local_sunshine.mark_changed(status["running"])
+            self._sessions = SessionTracker()
+        return {"ok": True, "error": None, "removed": removed,
+                "needsRestart": status["running"] and self.local_sunshine.config_pending}
+
+    # ------------------------------------------------------------------ backup
+
+    async def backup_list(self) -> dict[str, Any]:
+        home = decky.DECKY_USER_HOME
+        items, places = await asyncio.gather(
+            asyncio.to_thread(backup.list_backups, home), asyncio.to_thread(backup.locations, home)
+        )
+        return {"ok": True, "error": None, "items": items, "locations": places, "folder": backup.backup_dir(home)}
+
+    async def backup_create(self, include_passwords: bool = False, location_id: str = backup.HOME_LOCATION) -> dict[str, Any]:
+        options: Optional[dict[str, Any]] = None
+        games: list[dict[str, Any]] = []
+        status = await self.local_sunshine.status()
+        if status["installed"] and not (status.get("native") or {}).get("legacy"):
+            try:
+                values = await self.local_sunshine.read_options()
+                defaults = sunshine_config.defaults()
+                options = {k: v for k, v in values.items() if v != defaults.get(k)}
+                apps = await asyncio.to_thread(sunshine_apps.list_apps, await self.local_sunshine.config_dir())
+                games = [{"appId": a["steamAppId"], "name": a["name"]} for a in apps if a["steamAppId"]]
+            except (OSError, ValueError) as exc:
+                log.warning("Backup without Sunshine's options: %s", exc)
+        data = backup.build(
+            self.settings.data, options, games, bool(include_passwords),
+            updates.read_package(decky.DECKY_PLUGIN_DIR).get("version"),
+        )
+        try:
+            path = await asyncio.to_thread(backup.write, decky.DECKY_USER_HOME, data, str(location_id))
+        except (OSError, ValueError) as exc:
+            return {"ok": False, "error": f"Could not write the backup: {exc}"}
+        log.info("Backup written to %s", path)
+        return {"ok": True, "error": None, "path": path, "name": os.path.basename(path)}
+
+    async def _restore_sunshine_login(self, status: dict[str, Any], warnings: list[str]) -> None:
+        """A restored login is only useful if Sunshine has it: a fresh Sunshine gets it created."""
+        cfg = self.settings.data["sunshine"]
+        if not status["running"] or not cfg.get("user") or not cfg.get("password"):
+            return
+        if (await self.sunshine_login_state())["state"] != "needs_setup":
+            return
+        result = await self.sunshine_create_login(cfg["user"], cfg["password"])
+        if not result["ok"]:
+            warnings.append(f"Sunshine's login was not created: {result['error']}")
+
+    async def backup_delete(self, location_id: str, name: str) -> dict[str, Any]:
+        try:
+            await asyncio.to_thread(backup.delete, decky.DECKY_USER_HOME, str(location_id), str(name))
+        except (OSError, ValueError) as exc:
+            return {"ok": False, "error": f"Could not delete the backup: {exc}"}
+        return {"ok": True, "error": None}
+
+    async def backup_restore(self, location_id: str, name: str) -> dict[str, Any]:
+        """Restore settings and Sunshine's options from a backup. The Steam games it lists come
+        back in ``games`` (those installed here), for the frontend to add with their covers."""
+        try:
+            data = await asyncio.to_thread(backup.read, decky.DECKY_USER_HOME, str(location_id), str(name))
+        except (OSError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+        self.settings.replace(backup.merge_settings(self.settings.data, data["settings"], DEFAULT_SETTINGS))
+        self._moonlight = None
+        warnings: list[str] = []
+        # The systemd service follows the restored autostart choice.
+        await self.local_sunshine.apply_autostart(bool(self.settings.data["sunshine"].get("autostart")))
+        games: list[dict[str, Any]] = []
+        status = await self.local_sunshine.status()
+        sunshine_ready = status["installed"] and not (status.get("native") or {}).get("legacy")
+        restored = data.get("sunshineOptions")
+        if sunshine_ready and isinstance(restored, dict):
+            # Options the backup does not list were at their defaults then.
+            patch = {}
+            for key, default in sunshine_config.defaults().items():
+                try:
+                    patch[key] = sunshine_config.validate(key, restored.get(key, default))
+                except ValueError:
+                    warnings.append(f"Skipped the Sunshine option {key}")
+            try:
+                await self.local_sunshine.write_options(patch, status["running"])
+            except (OSError, ValueError) as exc:
+                warnings.append(f"Sunshine's options were not restored: {exc}")
+        backup_games = data.get("sunshineGames") or []
+        if sunshine_ready:
+            installed = {g["appId"] for g in await asyncio.to_thread(sunshine_apps.installed_games, decky.DECKY_USER_HOME)}
+            for game in backup_games:
+                try:
+                    app_id = int(game["appId"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if app_id in installed:
+                    games.append({"appId": app_id, "name": str(game.get("name") or "")})
+            skipped = len(backup_games) - len(games)
+            if skipped:
+                warnings.append(
+                    f"{skipped} game{'s are' if skipped > 1 else ' is'} not installed here: add "
+                    f"{'them' if skipped > 1 else 'it'} to Sunshine once installed"
+                )
+        elif isinstance(restored, dict) or backup_games:
+            warnings.append("Install Sunshine, then restore again to also bring back its options and games")
+        await self._restore_sunshine_login(status, warnings)
+        log.info("Restored settings from %s", name)
+        return {"ok": True, "error": None, "games": games, "warnings": warnings,
+                "settings": self.settings.public()}
+
     async def sunshine_set_autostart(self, enabled: bool) -> dict[str, Any]:
         """Persist the autostart option and sync the systemd user service with it."""
         self.settings.update({"sunshine": {"autostart": bool(enabled)}})
@@ -1016,7 +1451,7 @@ class Plugin:
     async def sunshine_diagnostics(self) -> dict[str, Any]:
         """Checks explaining why other devices cannot find or reach Sunshine here."""
         status = await self.local_sunshine.status()
-        return await diagnostics.run(status, decky.DECKY_USER_HOME)
+        return await diagnostics.run(status, decky.DECKY_USER_HOME, announced=self._mdns is not None)
 
     async def get_sunshine_log(self) -> str:
         """Tail of Sunshine's own log, falling back to the output of a plugin-started Sunshine."""
@@ -1127,6 +1562,15 @@ class Plugin:
     async def get_launcher_log(self) -> str:
         path = os.path.join(decky.DECKY_PLUGIN_SETTINGS_DIR, LAUNCHER_LOG)
         return await asyncio.to_thread(_tail, path, LOG_TAIL_LINES)
+
+
+def _head(path: str, size: int) -> str:
+    """The first ``size`` bytes of a file as text."""
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(size).decode(errors="replace")
+    except OSError:
+        return ""
 
 
 def _tail(path: str, lines: int) -> str:

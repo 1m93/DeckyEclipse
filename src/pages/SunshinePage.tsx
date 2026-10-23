@@ -14,6 +14,7 @@ import { backend } from "../backend";
 import { ButtonRow } from "../components/ButtonRow";
 import { InstallProgress } from "../components/InstallProgress";
 import { SunshineDevicesSection } from "../components/SunshineDevicesSection";
+import { SunshineGamesSection } from "../components/SunshineGamesSection";
 import { SunshineOptionsSections } from "../components/SunshineOptionsSections";
 import {
   confirmStopSunshine,
@@ -26,8 +27,39 @@ import {
 import { ACCENT, formatDuration } from "../lib/format";
 import { openEclipsePage } from "../lib/navigation";
 import { flushSettings, loadInitialState, refreshIncoming, refreshSharing, updateSettings, useStore } from "../lib/store";
-import { AUTO_OFF_OPTIONS, describeSunshine, repairReason, useSunshineStatus } from "../lib/sunshine";
-import type { SunshineLoginState, SunshineStatus } from "../types";
+import {
+  AUTO_OFF_OPTIONS,
+  BATTERY_GUARD_OPTIONS,
+  describeDevices,
+  describeSunshine,
+  repairReason,
+  useSunshineStatus,
+} from "../lib/sunshine";
+import type { SunshineLoginState, SunshineOverview, SunshineStatus } from "../types";
+
+const SHARING_POLL_MS = 10000;
+
+/** What "Help other devices find this one" does right now. */
+function describeAnnounce(
+  enabled: boolean,
+  state: SunshineOverview["announce"],
+  address: string | null,
+): string {
+  const byAddress = address ? ` Add this device in Moonlight by its address, ${address}.` : "";
+  if (!enabled) {
+    return `Off. If Moonlight does not list this device on its own, turn this on.${byAddress}`;
+  }
+  switch (state) {
+    case "active":
+      return "Active: Sunshine could not announce this device itself, so Eclipse does it. Moonlight on the same network lists it on its own.";
+    case "notNeeded":
+      return "Not needed now: Sunshine announces this device itself.";
+    case "failed":
+      return `Eclipse could not announce this device either.${byAddress}`;
+    default:
+      return "When Sunshine cannot announce this device on the network, Eclipse does it, so Moonlight lists it on its own.";
+  }
+}
 
 const INSTALL_DESCRIPTION =
   "Installs Sunshine for Gaming Mode: Sunshine's official build, set up so it can stream Gaming Mode " +
@@ -112,6 +144,11 @@ function SetupSteps({ running, loginDone, paired }: { running: boolean; loginDon
         label="Pair a device"
         detail="Install Moonlight (moonlight-stream.org) on the other device and select this device there. Then enter the PIN it shows under Devices."
       />
+      <Step
+        done={false}
+        label="Optional: choose games"
+        detail="Under Games for other devices. Without them, Moonlight offers Desktop and Steam Big Picture."
+      />
     </DialogControlsSection>
   );
 }
@@ -132,7 +169,11 @@ function ActivitySection() {
   let description: string;
   if (incoming.clients > 0) {
     label = incoming.clients === 1 ? "A device is streaming from here" : `${incoming.clients} devices are streaming from here`;
-    description = [incoming.appName, incoming.since ? formatDuration(now - incoming.since) : null]
+    description = [
+      describeDevices(incoming.devices, incoming.clients),
+      incoming.appName,
+      incoming.since ? formatDuration(now - incoming.since) : null,
+    ]
       .filter(Boolean)
       .join(" · ");
   } else {
@@ -166,7 +207,14 @@ export function SunshinePage() {
   useEffect(() => {
     void refreshIncoming();
     if (running) void refreshSharing();
-  }, [running, login.state]);
+  }, [running, login.state, sunshine?.announce]);
+
+  // Eclipse starts announcing this device some seconds after Sunshine: keep the status current.
+  useEffect(() => {
+    if (!running) return;
+    const timer = window.setInterval(() => void refreshSharing(), SHARING_POLL_MS);
+    return () => window.clearInterval(timer);
+  }, [running]);
 
   if (!sunshine) return null;
   const repair = status ? repairReason(status) : null;
@@ -217,6 +265,13 @@ export function SunshinePage() {
               rgOptions={AUTO_OFF_OPTIONS}
               selectedOption={sunshine.autoOff}
               onChange={(opt) => updateSettings({ sunshine: { autoOff: opt.data } }, 0)}
+            />
+            <DropdownItem
+              label="Turn off on low battery"
+              description="When the battery falls to this level while not charging, Sunshine turns off (after the current stream). Started on purpose below it, Sunshine stays on."
+              rgOptions={BATTERY_GUARD_OPTIONS}
+              selectedOption={sunshine.batteryGuard}
+              onChange={(opt) => updateSettings({ sunshine: { batteryGuard: opt.data } }, 0)}
             />
             {status.unitEnabled && !status.autostart && (
               <ButtonItem
@@ -279,6 +334,18 @@ export function SunshinePage() {
                   : "Connect to the same Wi-Fi or LAN as the other device."
               }
             />
+            {sharing?.remoteAddress && (
+              <Field
+                label={`Away from home: ${sharing.remoteAddress}`}
+                description="Tailscale address of this device. A device in the same tailnet adds it in Moonlight with this address."
+              />
+            )}
+            <ToggleField
+              label="Help other devices find this one"
+              description={describeAnnounce(sunshine.announce, sharing?.announce, sharing?.address ?? null)}
+              checked={sunshine.announce}
+              onChange={(checked) => updateSettings({ sunshine: { announce: checked } }, 0)}
+            />
             <ButtonItem
               layout="below"
               description="Checks the network, firewall and screen capture, and shows Sunshine's log."
@@ -294,6 +361,7 @@ export function SunshinePage() {
               Open Sunshine web UI
             </ButtonItem>
           </DialogControlsSection>
+          {!status.native?.legacy && <SunshineGamesSection running={running} />}
           <SunshineOptionsSections running={running} legacy={Boolean(status.native?.legacy)} />
         </>
       )}
