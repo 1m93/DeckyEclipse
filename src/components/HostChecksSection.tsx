@@ -63,7 +63,7 @@ export function HostChecksSection({ initialHost, nonce }: { initialHost: string 
     return (
       <DialogControlsSection>
         <DialogControlsSectionHeader>Play: connection to a host</DialogControlsSectionHeader>
-        <Field label="No hosts yet" description="Add a host first, from the Quick Access menu or the Hosts page." />
+        <Field label="No hosts yet" description="Add a host first, from the Quick Access menu or Settings → Streaming." />
       </DialogControlsSection>
     );
   }
@@ -73,7 +73,7 @@ export function HostChecksSection({ initialHost, nonce }: { initialHost: string 
   const fixes = [
     ...(canWake ? [{ label: "Wake the PC", onClick: () => void wakeHost(host) }] : []),
     ...(failed("paired") ? [{ label: "Pair again", onClick: () => showPairModal({ address: "", host }) }] : []),
-    { label: "Host settings", onClick: () => openEclipsePage("hosts", host.uuid) },
+    { label: "Host settings", onClick: () => openEclipsePage("streaming", host.uuid) },
   ];
   const problems = checks?.filter((c) => c.ok === false).length ?? 0;
 

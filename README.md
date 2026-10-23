@@ -31,9 +31,9 @@ The Quick Access menu treats both halves the same:
 - At the top, whatever is happening right now: the stream you are playing, devices streaming from this one,
   and devices asking to pair. Each comes with its action (*End stream*, *Enter PIN*).
 - Below it, two tabs: **Play** (hosts and stream quality) and **Share** (the Sunshine server, this device's
-  address, pairing). The menu remembers the last tab and opens on the side where something is happening.
-- The full-screen settings follow the same order: *Hosts* and *Stream quality*, then *Sharing*, then
-  *General*, *Troubleshooting* (connection checks and logs) and *About*.
+  address, pairing and the most used sharing options). The menu remembers the last tab and opens on the side where something is happening.
+- The full-screen settings follow the same order: *Streaming* (profiles, stream quality and hosts), then
+  *Sharing*, then *General*, *Troubleshooting* (connection checks and logs) and *About*.
 
 **Streaming (Moonlight client)**
 
@@ -54,7 +54,10 @@ The Quick Access menu treats both halves the same:
 - Fixed presets are also available (Deck 800p60, OLED 90 FPS, battery saver, remote/weak Wi-Fi, 1080p, 1440p,
   4K). You can also set resolution, FPS, bitrate, codec, HDR, YUV 4:4:4, audio, frame pacing, V-Sync and more by
   hand.
-- You can give a host its own quality preset, for example a lower one for a remote PC.
+- **Profiles**: *Save as profile* keeps the current stream settings under a name (for example TV or Hotel
+  Wi-Fi). A profile is picked like a preset, in the settings or the Quick Access menu, and every change made
+  while it is selected is saved to it. Profiles can be renamed and deleted.
+- You can give a host its own preset or profile, for example a lower one for a remote PC.
 - **Host display selection** for hosts with several monitors. Moonlight cannot choose a host display, so Eclipse
   changes Sunshine's *Output Name* (`output_name`) setting through the Sunshine web API and restarts Sunshine
   before the stream starts. This needs the host's Sunshine credentials.
@@ -82,7 +85,7 @@ The Quick Access menu treats both halves the same:
 - *Troubleshooting → Play* checks the connection to a host step by step (network, the PC answers, Sunshine
   runs, paired, Wake-on-LAN, its Sunshine login) and offers the fix (*Wake*, *Pair again*). Stream failure
   notifications open it.
-- **Ending a stream also ends the session on the host by default** (*End the host session too* in *Stream quality*
+- **Ending a stream also ends the session on the host by default** (*End the host session too* in *Streaming*
   settings). Moonlight gets `--quit-after`. Steam's End stream and Exit game kill Moonlight, which can leave the
   app open on the host, so Eclipse checks the host a few seconds after the stream ends. If an app is still
   open, Eclipse closes it through the Sunshine API when credentials are saved, or with `moonlight quit`
@@ -108,6 +111,12 @@ The Quick Access menu treats both halves the same:
 - A Sunshine Flatpak is still detected and controlled, but it cannot stream Gaming Mode. Eclipse offers to
   install Sunshine for Gaming Mode instead and to remove the Flatpak.
 - Pair Moonlight clients with your Deck and see the real result (paired, wrong PIN, timed out).
+- **Sunshine's own options** in *Sharing*, so the web page is rarely needed: the name shown in Moonlight,
+  maximum bitrate, encoder, HEVC/AV1, minimum frame rate, error correction, audio, controllers (type, Back for
+  Home), keyboard, mouse, touch, encryption, UPnP, IPv6, web page access, timeout and log detail. The Share tab
+  has the most used ones. Eclipse edits `sunshine.conf` directly (no login needed), keeps every line it does
+  not know and drops values equal to Sunshine's default. Sunshine reads the file when it starts, so while it
+  runs Eclipse offers *Restart now*, and asks first when devices are streaming.
   - Newer Sunshine versions list the devices waiting to pair. They show up live at the top of the Quick Access
     menu and on the *Sharing* page.
   - Older versions take the PIN only. Eclipse then confirms pairing by watching for the new device in the
@@ -183,11 +192,12 @@ py_modules/eclipse/         Shared Python modules (no dependency on Decky)
   network.py                Async /serverinfo probes, Wake-on-LAN
   sunshine.py               Sunshine web API client, local service control
   sunshine_native.py        Sunshine for Gaming Mode (shared with the root installer)
+  sunshine_config.py        Options of the local Sunshine (sunshine.conf)
 bin/eclipse_sunshine_root.py  Root installer of Sunshine for Gaming Mode (run with sudo)
 native/                     C helpers of Sunshine for Gaming Mode (launcher, preload library)
   host_display.py           Host display detection/switching via Sunshine output_name
   launch.py                 Launch request file + argv building
-  presets.py / settings.py  Presets and persistent settings
+  presets.py / settings.py  Presets, saved profiles and persistent settings
 src/                        React frontend (Quick Access panel + full-screen settings)
 tests/                      Backend unit tests (stdlib unittest)
 ```

@@ -10,6 +10,8 @@ import type {
   InstallResult,
   PluginUpdateCheck,
   StreamSession,
+  SunshineOptions,
+  SunshineOptionsResult,
 } from "../types";
 import {
   flushSettings,
@@ -189,7 +191,7 @@ function ConfirmEndStreamModal({
   return (
     <ConfirmModal
       strTitle={`Close ${session.appName} on ${session.hostName}?`}
-      strDescription="Ending the stream also closes the game on the host, so unsaved progress there may be lost. To keep games open after a stream, turn off End the host session too in Stream quality."
+      strDescription="Ending the stream also closes the game on the host, so unsaved progress there may be lost. To keep games open after a stream, turn off End the host session too in Settings → Streaming."
       strOKButtonText="End stream and close"
       closeModal={closeModal}
       onOK={() => {
@@ -311,6 +313,107 @@ export function confirmStopSunshine(onStop: () => void): void {
       onOK={onStop}
     />,
   );
+}
+
+function applyOptionsResult(res: SunshineOptionsResult): boolean {
+  if (!res.ok || !res.values || !res.defaults) return false;
+  const { values, defaults } = res;
+  setState((prev) => ({
+    sunshineOptions: {
+      values,
+      defaults,
+      needsRestart: Boolean(res.needsRestart),
+      restarting: prev.sunshineOptions?.restarting ?? false,
+    },
+  }));
+  return true;
+}
+
+/** Option writes queued and not finished yet, and how many were ever queued. */
+let writesPending = 0;
+let writesQueued = 0;
+
+/**
+ * Read the options again. Resolves to an error text when they could not be
+ * read. A read that overlaps a write is dropped: it may predate the write.
+ */
+export async function refreshSunshineOptions(): Promise<string | null> {
+  const queuedBefore = writesQueued;
+  try {
+    const res = await backend.sunshineGetOptions();
+    if (writesPending > 0 || writesQueued !== queuedBefore) return null;
+    if (applyOptionsResult(res)) return null;
+    return res.error ?? "Could not read Sunshine's options";
+  } catch (err) {
+    return `Could not read Sunshine's options: ${errorText(err)}`;
+  }
+}
+
+/** Writes one after another: each reads and rewrites the same file. */
+let optionsQueue: Promise<unknown> = Promise.resolve();
+
+/**
+ * Change options of the Sunshine on this device: shown at once, saved in
+ * order. Resolves to an error text (also shown as a toast) or null.
+ */
+export function setSunshineOptions(patch: Partial<SunshineOptions>): Promise<string | null> {
+  setState((prev) =>
+    prev.sunshineOptions
+      ? { sunshineOptions: { ...prev.sunshineOptions, values: { ...prev.sunshineOptions.values, ...patch } } }
+      : {},
+  );
+  writesPending += 1;
+  writesQueued += 1;
+  const write = optionsQueue.then(async (): Promise<string | null> => {
+    let error: string | null = null;
+    let res: SunshineOptionsResult | null = null;
+    try {
+      res = await backend.sunshineSetOptions(patch);
+      if (!res.ok) error = res.error ?? "Could not save the Sunshine option";
+    } catch (err) {
+      error = `Could not save the Sunshine option: ${errorText(err)}`;
+    }
+    writesPending -= 1;
+    if (error) {
+      notify(error);
+      // Show what the file really holds; later writes refresh again on their own.
+      if (writesPending === 0) await refreshSunshineOptions();
+    } else if (res && writesPending === 0) {
+      // Earlier results would undo the optimistic values of writes still waiting.
+      applyOptionsResult(res);
+    }
+    return error;
+  });
+  optionsQueue = write;
+  return write;
+}
+
+/** Restart Sunshine so changed options apply; asks first when devices are streaming from here. */
+export function restartSunshineToApply(): void {
+  const run = async () => {
+    setState((prev) => (prev.sunshineOptions ? { sunshineOptions: { ...prev.sunshineOptions, restarting: true } } : {}));
+    quietUntil = Date.now() + QUIET_AFTER_END_MS;
+    try {
+      // A change still being saved must be in the file before Sunshine reads it.
+      await optionsQueue;
+      const res = await backend.sunshineRestart();
+      notify(res.ok ? "Sunshine restarted with the new options." : (res.error ?? "Could not restart Sunshine"));
+    } catch (err) {
+      notify(`Could not restart Sunshine: ${errorText(err)}`);
+    } finally {
+      setState((prev) =>
+        prev.sunshineOptions ? { sunshineOptions: { ...prev.sunshineOptions, restarting: false } } : {},
+      );
+      await refreshSunshineOptions();
+      refreshIncomingSoon();
+    }
+  };
+  const clients = getState().incoming?.clients ?? 0;
+  if (clients === 0) {
+    void run();
+    return;
+  }
+  confirmRestart("The new options apply after a restart.", () => void run());
 }
 
 /**

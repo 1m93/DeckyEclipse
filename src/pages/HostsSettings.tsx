@@ -10,7 +10,7 @@ import {
   showContextMenu,
   showModal,
 } from "@decky/ui";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { backend } from "../backend";
 import { showAddHostModal } from "../components/AddHostModal";
 import { showAppPicker } from "../components/AppPickerModal";
@@ -22,7 +22,7 @@ import { StatusDot } from "../components/StatusDot";
 import { notify, wakeHost } from "../lib/actions";
 import { describeHost, FALLBACK_APPS, hostState } from "../lib/format";
 import { addLibraryShortcut, removeLibraryShortcut } from "../lib/steam";
-import { setHostConfig, useStore } from "../lib/store";
+import { profileOptions, setHostConfig, useStore } from "../lib/store";
 import type { Host, HostConfig, Patch } from "../types";
 
 const EMPTY_CFG: HostConfig = {};
@@ -68,14 +68,22 @@ function HostDetails({ host }: { host: Host }) {
   const status = useStore((s) => s.status[host.uuid]);
   const cfg = useStore((s) => s.settings?.hosts[host.uuid]) ?? EMPTY_CFG;
   const presets = useStore((s) => s.presets);
+  const profiles = useStore((s) => s.settings?.profiles);
   const inheritPreset = useStore((s) => s.inheritPreset);
   const library = useStore((s) => s.settings?.shortcuts.library);
   const streamingHere = useStore((s) => s.session?.hostUuid === host.uuid);
 
-  const presetOptions = useMemo(
-    () => [{ data: inheritPreset, label: "Use global stream settings" }, ...presets.map((p) => ({ data: p.id, label: p.label }))],
-    [presets, inheritPreset],
-  );
+  const presetOptions = useMemo(() => {
+    const options = [
+      { data: inheritPreset, label: "Same as the settings above" },
+      ...profileOptions(profiles),
+      ...presets.map((p) => ({ data: p.id, label: p.label })),
+    ];
+    // A pinned preset that no longer exists still shows as what it does now.
+    return cfg.preset && !options.some((o) => o.data === cfg.preset)
+      ? [...options, { data: cfg.preset, label: "Removed profile (same as above)" }]
+      : options;
+  }, [presets, profiles, inheritPreset, cfg.preset]);
   const entries = useMemo(
     () => Object.entries(library ?? {}).filter(([, e]) => e.hostUuid === host.uuid),
     [library, host.uuid],
@@ -113,10 +121,10 @@ function HostDetails({ host }: { host: Host }) {
       </DialogControlsSection>
 
       <DialogControlsSection>
-        <DialogControlsSectionHeader>Streaming</DialogControlsSectionHeader>
+        <DialogControlsSectionHeader>Profile for this host</DialogControlsSectionHeader>
         <DropdownItem
-          label="Quality for this host"
-          description="Pin a preset, e.g. for a weaker or remote PC. Other options follow the global Streaming settings."
+          label="Profile"
+          description="Use another preset or profile for this host, e.g. for a weaker or remote PC."
           rgOptions={presetOptions}
           selectedOption={cfg.preset ?? inheritPreset}
           onChange={(opt) => void save({ preset: opt.data })}
@@ -193,46 +201,62 @@ function HostDetails({ host }: { host: Host }) {
   );
 }
 
-export function HostsPage() {
+/** `pageTarget.nonce` of the last request to show a host that was handled. */
+let handledNonce = -1;
+
+/** Hosts part of the Streaming page: pick a host and change its settings. */
+export function HostsSettings() {
   const hosts = useStore((s) => s.hosts);
-  const target = useStore((s) => s.pageTarget.host);
+  const target = useStore((s) => (s.pageTarget.page === "streaming" ? s.pageTarget.host : null));
   const nonce = useStore((s) => s.pageTarget.nonce);
   const [selected, setSelected] = useState<string | null>(target ?? hosts[0]?.uuid ?? null);
+  const anchor = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    if (target) setSelected(target);
+    // Each request is handled once: opening the page again later starts at the top.
+    if (!target || nonce === handledNonce) return;
+    handledNonce = nonce;
+    setSelected(target);
+    // The hosts come after the stream settings: bring the requested one into view and focus.
+    const timer = window.setTimeout(() => {
+      const section = anchor.current?.nextElementSibling;
+      section?.scrollIntoView({ block: "start" });
+      section?.querySelector<HTMLElement>("button, [tabindex]")?.focus();
+    }, 150);
+    return () => window.clearTimeout(timer);
   }, [target, nonce]);
 
   const host = hosts.find((h) => h.uuid === selected) ?? hosts[0];
   const options = useMemo(() => hosts.map((h) => ({ data: h.uuid, label: h.name })), [hosts]);
 
-  if (hosts.length === 0) {
-    return (
-      <DialogControlsSection>
-        <DialogControlsSectionHeader>No paired hosts</DialogControlsSectionHeader>
-        <ButtonItem
-          layout="below"
-          description="Pair this device with a PC running Sunshine. Paired hosts are read from Moonlight."
-          onClick={showAddHostModal}
-        >
-          Add host
-        </ButtonItem>
-      </DialogControlsSection>
-    );
-  }
-
   return (
     <>
+      {/* Marks where the hosts start, for requests to show a host. */}
+      <div ref={anchor} />
       <DialogControlsSection>
-        <DropdownItem
-          label="Host"
-          rgOptions={options}
-          selectedOption={host?.uuid}
-          onChange={(opt) => setSelected(opt.data)}
-        />
-        <ButtonItem layout="below" onClick={showAddHostModal}>
-          Add another host
-        </ButtonItem>
+        <DialogControlsSectionHeader>Hosts</DialogControlsSectionHeader>
+        {hosts.length === 0 ? (
+          <ButtonItem
+            layout="below"
+            label="No paired hosts"
+            description="Pair this device with a PC running Sunshine. Paired hosts are read from Moonlight."
+            onClick={showAddHostModal}
+          >
+            Add host
+          </ButtonItem>
+        ) : (
+          <>
+            <DropdownItem
+              label="Host"
+              rgOptions={options}
+              selectedOption={host?.uuid}
+              onChange={(opt) => setSelected(opt.data)}
+            />
+            <ButtonItem layout="below" onClick={showAddHostModal}>
+              Add another host
+            </ButtonItem>
+          </>
+        )}
       </DialogControlsSection>
       {host && <HostDetails key={host.uuid} host={host} />}
     </>

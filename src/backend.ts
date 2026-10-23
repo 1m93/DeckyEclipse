@@ -29,6 +29,8 @@ import type {
   StreamPrepareResult,
   SunshineDiagnostics,
   SunshineLoginState,
+  SunshineOptions,
+  SunshineOptionsResult,
   SunshineOverview,
   SunshineSession,
   SunshineStatus,
@@ -87,6 +89,9 @@ export const backend = {
   sunshineStatus: callable<[], SunshineStatus>("sunshine_status"),
   sunshineStart: callable<[], Result>("sunshine_start"),
   sunshineStop: callable<[], Result>("sunshine_stop"),
+  sunshineRestart: callable<[], Result>("sunshine_restart"),
+  sunshineGetOptions: callable<[], SunshineOptionsResult>("sunshine_get_options"),
+  sunshineSetOptions: callable<[patch: Partial<SunshineOptions>], SunshineOptionsResult>("sunshine_set_options"),
   sunshineSetAutostart: callable<[enabled: boolean], Result>("sunshine_set_autostart"),
   sunshineSubmitPin: callable<[pin: string, clientName: string, pairingId: string | null], PairOutcome>(
     "sunshine_submit_pin",

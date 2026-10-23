@@ -64,6 +64,12 @@ export interface StreamSettings {
   keepAwake: boolean;
 }
 
+/** A stream setup saved by the user, selected like a preset. */
+export interface StreamProfile {
+  name: string;
+  stream: StreamSettings;
+}
+
 export interface Preset {
   id: string;
   label: string;
@@ -125,8 +131,11 @@ export interface Settings {
   version: number;
   /** Opt-in features chosen during first-run setup. */
   features: { configured: boolean; moonlight: boolean; sunshine: boolean };
+  /** A built-in preset id, the Auto or Custom id, or the id of a saved profile. */
   activePreset: string;
   stream: StreamSettings;
+  /** Saved stream profiles, keyed by id ("p-..."). */
+  profiles: Record<string, StreamProfile>;
   hosts: Record<string, HostConfig>;
   moonlight: { source: MoonlightSource; customCommand: string };
   sunshine: {
@@ -390,6 +399,45 @@ export interface EndSessionResult extends Result {
   /** "closed": the open app was closed · "restarted": Sunshine was restarted. */
   method: "closed" | "restarted";
   /** The app could not be closed (no login, or Sunshine refused): only a restart ends the stream. */
+  needsRestart?: boolean;
+}
+
+/** Options of the Sunshine on this device (its sunshine.conf), see sunshine_config.py. */
+export interface SunshineOptions {
+  sunshine_name: string;
+  min_log_level: "verbose" | "debug" | "info" | "warning" | "error" | "fatal" | "none";
+  /** "": Sunshine picks the first encoder that works. */
+  encoder: "" | "vaapi" | "vulkan" | "software";
+  /** Kbps, 0: what Moonlight asks for. */
+  max_bitrate: number;
+  minimum_fps_target: number;
+  hevc_mode: number;
+  av1_mode: number;
+  fec_percentage: number;
+  stream_audio: boolean;
+  controller: boolean;
+  gamepad: "auto" | "xone" | "ds5" | "switch";
+  motion_as_ds4: boolean;
+  touchpad_as_ds4: boolean;
+  /** Milliseconds holding Back for Home, -1: off. */
+  back_button_timeout: number;
+  keyboard: boolean;
+  mouse: boolean;
+  high_resolution_scrolling: boolean;
+  native_pen_touch: boolean;
+  upnp: boolean;
+  address_family: "ipv4" | "both";
+  origin_web_ui_allowed: "pc" | "lan" | "wan";
+  lan_encryption_mode: number;
+  wan_encryption_mode: number;
+  ping_timeout: number;
+}
+
+export interface SunshineOptionsResult extends Result {
+  values?: SunshineOptions;
+  defaults?: SunshineOptions;
+  running?: boolean;
+  /** Sunshine runs with older options: a restart applies the changes. */
   needsRestart?: boolean;
 }
 

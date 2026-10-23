@@ -25,6 +25,9 @@ DEFAULTS: dict[str, Any] = {
     },
     "activePreset": AUTO_PRESET,
     "stream": dict(STREAM_DEFAULTS),
+    # Stream profiles saved by the user, keyed by id ("p-..."): {"name": str, "stream": {...}}.
+    # Selected like a preset (activePreset, or a host's preset).
+    "profiles": {},
     # Keyed by Moonlight host UUID. Fields: mac, preset, lastApp,
     # sunshineUser, sunshinePassword, sunshinePort, favorites.
     "hosts": {},

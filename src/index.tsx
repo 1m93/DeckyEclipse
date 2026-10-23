@@ -1,7 +1,7 @@
 import { addEventListener, definePlugin, removeEventListener, routerHook, toaster } from "@decky/api";
 import { Navigation, staticClasses } from "@decky/ui";
-import { FaMoon } from "react-icons/fa";
 import { Events } from "./backend";
+import { EclipseIcon } from "./components/icons";
 import { QuickPanel } from "./components/QuickPanel";
 import { checkPluginUpdate, handleStreamEnded, incomingToastsMuted, notify } from "./lib/actions";
 import { ROUTE } from "./lib/navigation";
@@ -84,7 +84,7 @@ export default definePlugin(() => {
     name: "Eclipse",
     titleView: <div className={staticClasses.Title}>Eclipse</div>,
     content: <QuickPanel />,
-    icon: <FaMoon />,
+    icon: <EclipseIcon />,
     onDismount() {
       stopAllPolling();
       void flushSettings();

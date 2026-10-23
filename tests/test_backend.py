@@ -23,6 +23,7 @@ from eclipse import sunshine_native  # noqa: E402
 from eclipse import sunshine_session  # noqa: E402
 from eclipse import account  # noqa: E402
 from eclipse import sunshine_data  # noqa: E402
+from eclipse import sunshine_config  # noqa: E402
 
 SAMPLE_CONF = r"""
 [General]
@@ -107,6 +108,19 @@ class StreamArgsTests(unittest.TestCase):
         self.assertEqual(stream["fps"], 30)
         self.assertTrue(stream["hdr"], "non-preset values stay global")
         self.assertEqual(effective_stream(settings, "other")["fps"], 60)
+
+    def test_saved_profile_applies_globally_and_per_host(self):
+        profile = {"name": "Couch", "stream": {"fps": 120, "hdr": True, "bogus": 1}}
+        settings = {"activePreset": "p-1", "stream": {"fps": 60}, "profiles": {"p-1": profile}, "hosts": {}}
+        stream = effective_stream(settings)
+        self.assertEqual((stream["fps"], stream["hdr"]), (120, True))
+        self.assertNotIn("bogus", stream)
+        settings = {"activePreset": "custom", "stream": {"fps": 60}, "profiles": {"p-1": profile},
+                    "hosts": {"h1": {"preset": "p-1"}}}
+        self.assertEqual(effective_stream(settings, "h1")["fps"], 120)
+        self.assertEqual(effective_stream(settings, "h2")["fps"], 60)
+        settings["hosts"]["h1"]["preset"] = "p-deleted"
+        self.assertEqual(effective_stream(settings, "h1")["fps"], 60, "a deleted profile falls back")
 
 
 def dtd(width, height, refresh, h_blank=160, v_blank=40):
@@ -1191,6 +1205,31 @@ class SunshineDataTests(unittest.TestCase):
         self.write(os.path.join(self.legacy, "b"), "y")
         sunshine_data.remove_all(self.home)
         self.assertFalse(os.path.exists(self.new) or os.path.exists(self.legacy))
+
+
+class SunshineConfigTests(unittest.TestCase):
+    def test_reads_values_and_defaults(self):
+        values = sunshine_config.read("# comment\nstream_audio = off\nmax_bitrate = 20000\ngamepad = nope\n")
+        self.assertFalse(values["stream_audio"])
+        self.assertEqual(values["max_bitrate"], 20000)
+        self.assertEqual(values["gamepad"], "auto", "an invalid value reads as the default")
+        self.assertTrue(values["controller"])
+        self.assertEqual(sunshine_config.read("fec_percentage = 30   # lossy wifi\n")["fec_percentage"], 30)
+
+    def test_apply_keeps_other_lines_and_drops_defaults(self):
+        text = "system_tray = disabled\nstream_audio = disabled\noutput_name = 1\nstream_audio = enabled\n"
+        out = sunshine_config.apply(text, {"stream_audio": True, "max_bitrate": 30000, "gamepad": "ds5"})
+        self.assertEqual(out, "system_tray = disabled\noutput_name = 1\nmax_bitrate = 30000\ngamepad = ds5\n")
+        out = sunshine_config.apply(out, {"mouse": False, "max_bitrate": 10000})
+        self.assertIn("max_bitrate = 10000\n", out)
+        self.assertIn("mouse = disabled\n", out)
+        self.assertEqual(sunshine_config.apply("", {"upnp": False}), "")
+
+    def test_invalid_values_are_rejected(self):
+        for patch in ({"max_bitrate": -5}, {"stream_audio": "yes"}, {"gamepad": "x360"}, {"nope": 1},
+                      {"sunshine_name": "a\nb"}, {"sunshine_name": "Deck #1"}, {"sunshine_name": "[Deck"}, {"fec_percentage": 1.5}, {"ping_timeout": True}):
+            with self.assertRaises(ValueError, msg=str(patch)):
+                sunshine_config.apply("", patch)
 
 
 if __name__ == "__main__":

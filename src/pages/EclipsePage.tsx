@@ -1,12 +1,12 @@
 import { SidebarNavigation } from "@decky/ui";
 import { useEffect, type ReactNode } from "react";
-import { FaCog, FaDesktop, FaInfoCircle, FaSlidersH, FaSun, FaWrench } from "react-icons/fa";
+import { FaCog, FaInfoCircle, FaWrench } from "react-icons/fa";
+import { PlayIcon, ShareIcon } from "../components/icons";
 import { pageRoute, type PageId } from "../lib/navigation";
 import { acquirePolling, flushSettings, loadInitialState, refreshDisplay, useStore } from "../lib/store";
 import { AboutPage } from "./AboutPage";
 import { GeneralPage } from "./GeneralPage";
-import { HostsPage } from "./HostsPage";
-import { StreamPage } from "./StreamPage";
+import { StreamingPage } from "./StreamingPage";
 import { SunshinePage } from "./SunshinePage";
 import { TroubleshootingPage } from "./TroubleshootingPage";
 
@@ -35,12 +35,11 @@ export function EclipsePage() {
 
   if (!ready) return null;
 
-  // Play (Moonlight) pages, then Share (Sunshine), in the order of the Quick
+  // Play (Moonlight), then Share (Sunshine), in the order of the Quick
   // Access tabs. Pages for features the user did not opt into are hidden.
   const pages: { id: PageId; title: string; icon: ReactNode; content: ReactNode; visible: boolean }[] = [
-    { id: "hosts", title: "Hosts", icon: <FaDesktop />, content: <HostsPage />, visible: useMoonlight },
-    { id: "stream", title: "Stream quality", icon: <FaSlidersH />, content: <StreamPage />, visible: useMoonlight },
-    { id: "sunshine", title: "Sharing", icon: <FaSun />, content: <SunshinePage />, visible: useSunshine },
+    { id: "streaming", title: "Streaming", icon: <PlayIcon />, content: <StreamingPage />, visible: useMoonlight },
+    { id: "sunshine", title: "Sharing", icon: <ShareIcon />, content: <SunshinePage />, visible: useSunshine },
     { id: "general", title: "General", icon: <FaCog />, content: <GeneralPage />, visible: true },
     { id: "help", title: "Troubleshooting", icon: <FaWrench />, content: <TroubleshootingPage />, visible: true },
     { id: "about", title: "About", icon: <FaInfoCircle />, content: <AboutPage />, visible: true },

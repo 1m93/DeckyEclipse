@@ -1,6 +1,9 @@
-import { DialogControlsSection, DialogControlsSectionHeader, Field } from "@decky/ui";
+import { ButtonItem, DialogControlsSection, DialogControlsSectionHeader, Field, Navigation } from "@decky/ui";
 import { PluginUpdateSection } from "../components/PluginUpdateSection";
 import { useStore } from "../lib/store";
+
+const AUTHOR = "1m93";
+const REPOSITORY_URL = "https://github.com/1m93/DeckyEclipse";
 
 export function AboutPage() {
   const configPath = useStore((s) => s.configPath);
@@ -16,6 +19,14 @@ export function AboutPage() {
           label="Moonlight & Sunshine for Gaming Mode"
           description="Play games streamed from a PC with Moonlight, and share this device's games with Sunshine, without leaving Gaming Mode."
         />
+        <Field label="Author" description={AUTHOR} />
+        <ButtonItem
+          layout="below"
+          description="Source code, releases and issue reports."
+          onClick={() => Navigation.NavigateToExternalWeb(REPOSITORY_URL)}
+        >
+          Open on GitHub
+        </ButtonItem>
         {useMoonlight && (
           <>
             <Field label="Moonlight config" description={configPath ?? "Not found (pair a host first)"} />

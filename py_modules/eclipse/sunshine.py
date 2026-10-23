@@ -14,7 +14,7 @@ from typing import Any, Callable, Optional
 
 from . import DEFAULT_SUNSHINE_WEB_PORT, FLATPAK_SUNSHINE
 from . import flatpak, proc
-from . import sunshine_data
+from . import sunshine_config, sunshine_data
 from . import sunshine_native as native
 from .log import get_logger
 
@@ -23,6 +23,8 @@ _OTHER_UNITS = ("sunshine.service", "app-dev.lizardbyte.app.Sunshine.service")
 _SYSTEMD_UNITS = (native.UNIT, *_OTHER_UNITS)
 _PROCESS_NAMES = ("sunshine", "Sunshine")
 _DETECT_CACHE_S = 60.0
+# How long a stopped Sunshine may take to exit before a restart starts it again.
+_RESTART_STOP_WAIT_S = 10.0
 
 
 # Sunshine answers every API call with this redirect (to /welcome) while no
@@ -278,7 +280,12 @@ class LocalSunshine:
         self.helpers_dir = os.path.join(plugin_dir, "bin", "native")
         self.unit_path = os.path.join(home, ".config", "systemd", "user", native.UNIT)
         self.config_path = os.path.join(home, ".config", "sunshine", "sunshine.conf")
+        self.flatpak_config_path = os.path.join(
+            home, ".var", "app", FLATPAK_SUNSHINE, "config", "sunshine", "sunshine.conf"
+        )
         self._spawned_pid: Optional[int] = None
+        # The config file changed while Sunshine was running: it applies after a restart.
+        self.config_pending = False
         self._detected: Optional[dict[str, Any]] = None
         self._detected_at = 0.0
 
@@ -366,6 +373,7 @@ class LocalSunshine:
             self._spawned_pid = proc.spawn_detached(["sunshine"], self.home, self.log_path)
         else:
             return {"ok": False, "error": "Sunshine is not installed on this device"}
+        self.config_pending = False
         return {"ok": True, "error": None}
 
     async def stop(self) -> dict[str, Any]:
@@ -380,7 +388,67 @@ class LocalSunshine:
             except OSError:
                 pass
         self._spawned_pid = None
+        self.config_pending = False
         return {"ok": True, "error": None}
+
+    async def restart(self) -> dict[str, Any]:
+        """Stop Sunshine, wait until it has exited (its ports are then free), and start it again."""
+        pending = self.config_pending
+        await self.stop()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _RESTART_STOP_WAIT_S
+        while proc.find_processes(_PROCESS_NAMES):
+            if loop.time() >= deadline:
+                # Still the old process: the changes have not been applied.
+                self.config_pending = pending
+                return {"ok": False, "error": "Sunshine did not stop. Try again, or turn it off and on."}
+            await asyncio.sleep(0.5)
+        await asyncio.sleep(0.5)
+        return await self.start()
+
+    # ------------------------------------------------------------ options (sunshine.conf)
+
+    async def _config_file(self) -> str:
+        info = await self.detect()
+        return self.flatpak_config_path if info["kind"] == "flatpak" else self.config_path
+
+    async def read_options(self) -> dict[str, Any]:
+        path = await self._config_file()
+
+        def read() -> str:
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    return fh.read()
+            except FileNotFoundError:
+                return ""
+
+        return sunshine_config.read(await asyncio.to_thread(read))
+
+    async def write_options(self, patch: dict[str, Any], running: bool) -> dict[str, Any]:
+        """Change options in sunshine.conf. Raises ValueError for an invalid value."""
+        path = await self._config_file()
+
+        def write() -> dict[str, Any]:
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    text = fh.read()
+            except FileNotFoundError:
+                text = ""
+            new_text = sunshine_config.apply(text, patch)
+            if new_text != text:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                temp = path + ".eclipse-tmp"
+                with open(temp, "w", encoding="utf-8") as fh:
+                    fh.write(new_text)
+                if os.path.exists(path):
+                    os.chmod(temp, os.stat(path).st_mode & 0o777)
+                os.replace(temp, path)
+            return {"changed": new_text != text, "values": sunshine_config.read(new_text)}
+
+        result = await asyncio.to_thread(write)
+        if result["changed"] and running:
+            self.config_pending = True
+        return result["values"]
 
     async def apply_autostart(self, enabled: bool) -> dict[str, Any]:
         """Make the systemd user service (if any) match the autostart option.

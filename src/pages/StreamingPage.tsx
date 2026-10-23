@@ -1,7 +1,33 @@
-import { DialogControlsSection, DialogControlsSectionHeader, DropdownItem, SliderField, ToggleField } from "@decky/ui";
+import {
+  ButtonItem,
+  ConfirmModal,
+  DialogControlsSection,
+  DialogControlsSectionHeader,
+  DropdownItem,
+  Menu,
+  MenuItem,
+  MenuSeparator,
+  SliderField,
+  ToggleField,
+  showContextMenu,
+  showModal,
+} from "@decky/ui";
 import { useMemo } from "react";
-import { applyPreset, updateStream, useStore } from "../lib/store";
-import type { AudioConfig, DisplayMode, StreamSettings, VideoCodec, VideoDecoder } from "../types";
+import { showProfileNameModal } from "../components/ProfileNameModal";
+import { notify } from "../lib/actions";
+import {
+  applyPreset,
+  createProfile,
+  deleteProfile,
+  renameProfile,
+  streamChoices,
+  suggestProfileName,
+  updateStream,
+  useStore,
+} from "../lib/store";
+import { formatBitrate } from "../lib/format";
+import type { AudioConfig, DisplayMode, StreamProfile, StreamSettings, VideoCodec, VideoDecoder } from "../types";
+import { HostsSettings } from "./HostsSettings";
 
 const RESOLUTIONS = [
   "1280x720",
@@ -62,15 +88,143 @@ const TOGGLES: { key: ToggleKey; label: string; description: string }[] = [
   { key: "keepAwake", label: "Keep display awake", description: "Prevent this device's screen from dimming while streaming." },
 ];
 
-export function StreamPage() {
+function confirmDeleteProfile(id: string, name: string, pinnedHosts: number) {
+  showModal(
+    <ConfirmModal
+      strTitle={`Delete "${name}"?`}
+      strDescription={
+        pinnedHosts > 0
+          ? `The current settings stay as they are. ${pinnedHosts === 1 ? "A host uses" : `${pinnedHosts} hosts use`} this profile and will follow the settings on this page again.`
+          : "The current settings stay as they are, as Custom."
+      }
+      strOKButtonText="Delete"
+      bDestructiveWarning
+      onOK={() => {
+        deleteProfile(id);
+        notify(`Deleted profile "${name}"`);
+      }}
+    />,
+  );
+}
+
+function saveAsNewProfile() {
+  showProfileNameModal({
+    title: "Save as a profile",
+    action: "Save",
+    initial: suggestProfileName(),
+    onSave: (name) => {
+      createProfile(name);
+      notify(`Saved profile "${name}"`);
+    },
+  });
+}
+
+function showProfileMenu(id: string, name: string, active: boolean, pinnedHosts: number, target?: EventTarget) {
+  showContextMenu(
+    <Menu label={name}>
+      {!active && <MenuItem onClick={() => applyPreset(id)}>Use this profile</MenuItem>}
+      <MenuItem
+        onClick={() =>
+          showProfileNameModal({
+            title: "Rename profile",
+            action: "Rename",
+            initial: name,
+            ignoreId: id,
+            onSave: (next) => renameProfile(id, next),
+          })
+        }
+      >
+        Rename...
+      </MenuItem>
+      <MenuSeparator />
+      <MenuItem tone="destructive" onClick={() => confirmDeleteProfile(id, name, pinnedHosts)}>
+        Delete
+      </MenuItem>
+    </Menu>,
+    target,
+  );
+}
+
+function describeProfile(profile: StreamProfile, active: boolean, pinnedHosts: number): string {
+  const { stream } = profile;
+  const parts = [
+    `${stream.resolution.replace("x", " × ")} · ${stream.fps} FPS · ${formatBitrate(stream.bitrateKbps)} · ${stream.videoCodec}`,
+  ];
+  if (active) parts.push("In use");
+  if (pinnedHosts > 0) parts.push(pinnedHosts === 1 ? "Used by a host" : `Used by ${pinnedHosts} hosts`);
+  return parts.join(" · ");
+}
+
+/** Pick a built-in preset or a saved profile, save the current settings as a profile, manage saved ones. */
+function ProfileSection() {
   const settings = useStore((s) => s.settings);
   const presets = useStore((s) => s.presets);
+  const autoPreset = useStore((s) => s.autoPreset);
   const customPreset = useStore((s) => s.customPreset);
+  const profiles = settings?.profiles;
 
-  const presetOptions = useMemo(
-    () => [...presets.map((p) => ({ data: p.id, label: p.label })), { data: customPreset, label: "Custom" }],
-    [presets, customPreset],
+  const options = useMemo(() => streamChoices(presets, profiles, customPreset), [presets, profiles, customPreset]);
+  const saved = useMemo(() => Object.entries(profiles ?? {}).sort(([, a], [, b]) => a.name.localeCompare(b.name)), [profiles]);
+  if (!settings) return null;
+
+  const activeId = settings.activePreset;
+  const activeProfile = settings.profiles[activeId];
+  const description = activeProfile
+    ? "Your profile. Changes below are saved to it automatically."
+    : activeId === autoPreset
+      ? "Follows this device's display, so docking changes resolution and frame rate. Changing them switches to Custom."
+      : activeId === customPreset
+        ? "Your own settings, not saved as a profile."
+        : "Sets resolution, frame rate, bitrate and codec. Changing one of them switches to Custom.";
+  const pinned = (id: string) => Object.values(settings.hosts).filter((cfg) => cfg.preset === id).length;
+
+  return (
+    <>
+      <DialogControlsSection>
+        <DialogControlsSectionHeader>Profile</DialogControlsSectionHeader>
+        <DropdownItem
+          label="Profile"
+          description={description}
+          rgOptions={options}
+          selectedOption={activeId}
+          onChange={(opt) => applyPreset(opt.data)}
+        />
+        <ButtonItem
+          label={activeProfile ? "Save a copy as a new profile" : "Save as a profile"}
+          description="Keep the settings below under a name, to switch back to them in one step here or in the Quick Access menu."
+          onClick={saveAsNewProfile}
+        >
+          Save...
+        </ButtonItem>
+      </DialogControlsSection>
+
+      {saved.length > 0 && (
+        <DialogControlsSection>
+          <DialogControlsSectionHeader>Saved profiles</DialogControlsSectionHeader>
+          {saved.map(([id, profile]) => {
+            const active = id === activeId;
+            return (
+              <ButtonItem
+                key={id}
+                label={`★ ${profile.name}`}
+                description={describeProfile(profile, active, pinned(id))}
+                onClick={(evt) =>
+                  showProfileMenu(id, profile.name, active, pinned(id), evt.currentTarget ?? undefined)
+                }
+              >
+                Manage...
+              </ButtonItem>
+            );
+          })}
+        </DialogControlsSection>
+      )}
+    </>
   );
+}
+
+/** Streaming from a PC: profile, quality and behavior of streams, then the hosts. */
+export function StreamingPage() {
+  const settings = useStore((s) => s.settings);
   if (!settings) return null;
   const { stream } = settings;
   const resolutionOptions = RESOLUTIONS.some((r) => r.data === stream.resolution)
@@ -79,15 +233,10 @@ export function StreamPage() {
 
   return (
     <>
+      <ProfileSection />
+
       <DialogControlsSection>
         <DialogControlsSectionHeader>Quality</DialogControlsSectionHeader>
-        <DropdownItem
-          label="Preset"
-          description="Presets set resolution, frame rate, bitrate and codec. Changing any of them switches to Custom."
-          rgOptions={presetOptions}
-          selectedOption={settings.activePreset}
-          onChange={(opt) => opt.data !== customPreset && applyPreset(opt.data)}
-        />
         <DropdownItem
           label="Resolution"
           rgOptions={resolutionOptions}
@@ -173,6 +322,8 @@ export function StreamPage() {
           />
         ))}
       </DialogControlsSection>
+
+      <HostsSettings />
     </>
   );
 }

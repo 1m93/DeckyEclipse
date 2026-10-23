@@ -14,6 +14,7 @@ import { backend } from "../backend";
 import { ButtonRow } from "../components/ButtonRow";
 import { InstallProgress } from "../components/InstallProgress";
 import { SunshineDevicesSection } from "../components/SunshineDevicesSection";
+import { SunshineOptionsSections } from "../components/SunshineOptionsSections";
 import {
   confirmStopSunshine,
   createSunshineLoginAuto,
@@ -287,12 +288,13 @@ export function SunshinePage() {
             </ButtonItem>
             <ButtonItem
               layout="below"
-              description="Sunshine's own settings page, for apps, encoders and more."
+              description="Sunshine's own settings page, for apps and everything else."
               onClick={() => Navigation.NavigateToExternalWeb(`https://localhost:${sunshine.port || 47990}`)}
             >
               Open Sunshine web UI
             </ButtonItem>
           </DialogControlsSection>
+          <SunshineOptionsSections running={running} legacy={Boolean(status.native?.legacy)} />
         </>
       )}
     </>

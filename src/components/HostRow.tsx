@@ -19,7 +19,7 @@ function showHostMenu(host: Host, lastApp: string | undefined, canWake: boolean,
       {busy && <MenuItem onClick={() => void quitHostApp(host)}>Quit running app</MenuItem>}
       <MenuSeparator />
       <MenuItem onClick={() => showPairModal({ address: "", host })}>Pair again</MenuItem>
-      <MenuItem onClick={() => openEclipsePage("hosts", host.uuid)}>Host settings</MenuItem>
+      <MenuItem onClick={() => openEclipsePage("streaming", host.uuid)}>Host settings</MenuItem>
     </Menu>,
     target,
   );

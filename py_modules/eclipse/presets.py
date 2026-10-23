@@ -103,7 +103,8 @@ def effective_stream(
 
     The global ``stream`` block is the base. The Auto preset re-detects the
     display every time, so docking changes the stream without new settings.
-    When a host is pinned to a preset, that preset's values win for that host.
+    A profile saved by the user (``profiles``) holds a whole stream block.
+    When a host is pinned to a preset or profile, its values win for that host.
     """
     stream = {**STREAM_DEFAULTS, **(settings.get("stream") or {})}
     selected = settings.get("activePreset")
@@ -116,4 +117,8 @@ def effective_stream(
         stream.update(display.auto_values(display_info or display.detect()))
     elif selected in PRESETS_BY_ID:
         stream.update(PRESETS_BY_ID[selected]["values"])
+    else:
+        profile = (settings.get("profiles") or {}).get(selected) if isinstance(selected, str) else None
+        if isinstance(profile, dict) and isinstance(profile.get("stream"), dict):
+            stream.update({k: v for k, v in profile["stream"].items() if k in STREAM_DEFAULTS})
     return stream

@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.join(decky.DECKY_PLUGIN_DIR, "py_modules"))
 from eclipse import LAUNCHER_LOG, SETTINGS_FILE  # noqa: E402
 from eclipse import FLATPAK_MOONLIGHT, FLATPAK_SUNSHINE  # noqa: E402
 from eclipse import diagnostics, display, flatpak, host_display, launch, moonlight, network, updates  # noqa: E402
-from eclipse import proc, sunshine_data, sunshine_native  # noqa: E402
+from eclipse import proc, sunshine_config, sunshine_data, sunshine_native  # noqa: E402
 from eclipse.sunshine_session import AutoOff, SessionTracker  # noqa: E402
 from eclipse.log import set_logger  # noqa: E402
 from eclipse.moonlight_config import MoonlightConfig, find_boxart  # noqa: E402
@@ -942,10 +942,7 @@ class Plugin:
                 return {"ok": True, "error": None, "method": "closed"}
             log.info("Closing the Sunshine app failed: %s", result["error"])
             return {"ok": False, "error": result["error"], "method": "closed", "needsRestart": True}
-        await self.local_sunshine.stop()
-        # Let the ports free up before starting again.
-        await asyncio.sleep(1.0)
-        result = await self.local_sunshine.start()
+        result = await self.local_sunshine.restart()
         return {"ok": result["ok"], "error": result["error"], "method": "restarted"}
 
     async def sunshine_overview(self) -> dict[str, Any]:
@@ -970,6 +967,46 @@ class Plugin:
 
     async def sunshine_stop(self) -> dict[str, Any]:
         return await self.local_sunshine.stop()
+
+    async def _options_result(self, values: dict[str, Any]) -> dict[str, Any]:
+        status = await self.local_sunshine.status()
+        return {
+            "ok": True,
+            "error": None,
+            "values": values,
+            "defaults": sunshine_config.defaults(),
+            "running": status["running"],
+            # Only a Sunshine that has been running since the change still uses the old options.
+            "needsRestart": status["running"] and self.local_sunshine.config_pending,
+        }
+
+    async def sunshine_get_options(self) -> dict[str, Any]:
+        """Options of the Sunshine on this device (sunshine.conf), with Sunshine's defaults."""
+        try:
+            values = await self.local_sunshine.read_options()
+        except OSError as exc:
+            return {"ok": False, "error": f"Could not read Sunshine's config: {exc}"}
+        return await self._options_result(values)
+
+    async def sunshine_set_options(self, patch: dict[str, Any]) -> dict[str, Any]:
+        """Change options of the Sunshine on this device. They apply when Sunshine (re)starts."""
+        if not isinstance(patch, dict) or not patch:
+            return {"ok": False, "error": "Nothing to change"}
+        status = await self.local_sunshine.status()
+        if (status.get("native") or {}).get("legacy"):
+            # That build reads its config from the legacy folder; a repair moves it.
+            return {"ok": False, "error": "Repair Sunshine first: this copy keeps its config in the wrong folder."}
+        try:
+            values = await self.local_sunshine.write_options(patch, status["running"])
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        except OSError as exc:
+            return {"ok": False, "error": f"Could not save Sunshine's config: {exc}"}
+        return await self._options_result(values)
+
+    async def sunshine_restart(self) -> dict[str, Any]:
+        """Restart Sunshine so changed options apply. Ends every stream from this device."""
+        return await self.local_sunshine.restart()
 
     async def sunshine_set_autostart(self, enabled: bool) -> dict[str, Any]:
         """Persist the autostart option and sync the systemd user service with it."""

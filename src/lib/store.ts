@@ -14,6 +14,7 @@ import type {
   Settings,
   StreamSession,
   StreamSettings,
+  SunshineOptions,
   SunshineOverview,
   SunshineSession,
 } from "../types";
@@ -68,7 +69,18 @@ export interface State {
   sharing: SunshineOverview | null;
   /** The user asked to end the streams from this device and it is under way. */
   endingIncoming: boolean;
+  /** Options of the Sunshine on this device (sunshine.conf), once read. */
+  sunshineOptions: SunshineOptionsState | null;
   quickTab: QuickTab;
+}
+
+export interface SunshineOptionsState {
+  values: SunshineOptions;
+  defaults: SunshineOptions;
+  /** Sunshine still runs with older options: a restart applies the changes. */
+  needsRestart: boolean;
+  /** A restart to apply them is under way. */
+  restarting: boolean;
 }
 
 const QUICK_TAB_KEY = "eclipse.quickTab";
@@ -106,10 +118,11 @@ const initialState: State = {
   launching: null,
   launchStage: null,
   monitors: {},
-  pageTarget: { page: "hosts", host: null, nonce: 0 },
+  pageTarget: { page: "streaming", host: null, nonce: 0 },
   incoming: null,
   sharing: null,
   endingIncoming: false,
+  sunshineOptions: null,
   quickTab: readQuickTab(),
 };
 
@@ -383,17 +396,94 @@ export async function flushSettings(): Promise<void> {
   }
 }
 
-/** Update stream settings; any manual change detaches from the active preset. */
+/**
+ * Update stream settings. With a saved profile selected, the change is saved
+ * to that profile too; a change to a value a built-in preset sets detaches
+ * from that preset (Custom).
+ */
 export function updateStream(patch: Partial<StreamSettings>): void {
   const { presets, customPreset, settings } = state;
-  const active = presets.find((p) => p.id === settings?.activePreset);
+  const activeId = settings?.activePreset ?? "";
+  if (settings?.profiles[activeId]) {
+    updateSettings({ stream: patch, profiles: { [activeId]: { stream: patch } } });
+    return;
+  }
+  const active = presets.find((p) => p.id === activeId);
   const touchesPreset = active && Object.keys(patch).some((key) => key in active.values);
   updateSettings({ stream: patch, ...(touchesPreset ? { activePreset: customPreset } : {}) });
 }
 
 export function applyPreset(presetId: string): void {
-  const preset = state.presets.find((p) => p.id === presetId);
-  updateSettings({ activePreset: presetId, ...(preset ? { stream: preset.values } : {}) }, 0);
+  const profile = state.settings?.profiles[presetId];
+  const values = profile ? profile.stream : state.presets.find((p) => p.id === presetId)?.values;
+  updateSettings({ activePreset: presetId, ...(values ? { stream: values } : {}) }, 0);
+}
+
+/** Longest profile name; the dropdowns are narrow. */
+export const PROFILE_NAME_MAX = 32;
+
+/** Save the current stream settings as a new profile and select it. Returns its id. */
+export function createProfile(name: string): string {
+  const stream = state.settings?.stream;
+  if (!stream) return "";
+  const id = `p-${Date.now().toString(36)}`;
+  updateSettings({ profiles: { [id]: { name: name.trim(), stream: { ...stream } } }, activePreset: id }, 0);
+  return id;
+}
+
+export function renameProfile(id: string, name: string): void {
+  if (!state.settings?.profiles[id]) return;
+  updateSettings({ profiles: { [id]: { name: name.trim() } } }, 0);
+}
+
+/**
+ * Delete a profile. The current settings stay as they are (Custom) when it was
+ * selected, and hosts pinned to it follow the global settings again.
+ */
+export function deleteProfile(id: string): void {
+  const settings = state.settings;
+  if (!settings?.profiles[id]) return;
+  const pinned = Object.entries(settings.hosts).filter(([, cfg]) => cfg.preset === id);
+  updateSettings(
+    {
+      profiles: { [id]: null },
+      ...(settings.activePreset === id ? { activePreset: state.customPreset } : {}),
+      ...(pinned.length ? { hosts: Object.fromEntries(pinned.map(([uuid]) => [uuid, { preset: null }])) } : {}),
+    },
+    0,
+  );
+}
+
+/** Saved profiles sorted by name, for the dropdowns; a star tells them from the built-in presets. */
+export function profileOptions(profiles: Settings["profiles"] | undefined): { data: string; label: string }[] {
+  return Object.entries(profiles ?? {})
+    .map(([id, profile]) => ({ data: id, label: profile.name || "Unnamed profile" }))
+    .sort((a, b) => a.label.localeCompare(b.label))
+    .map((option) => ({ ...option, label: `★ ${option.label}` }));
+}
+
+/** Everything a stream can follow: Auto, the user's profiles, the built-in presets, then Custom. */
+export function streamChoices(
+  presets: Preset[],
+  profiles: Settings["profiles"] | undefined,
+  customPreset: string,
+): { data: string; label: string }[] {
+  const options = presets.map((p) => ({ data: p.id, label: p.label }));
+  const auto = options.filter((o) => o.data === state.autoPreset);
+  const builtIn = options.filter((o) => o.data !== state.autoPreset);
+  return [...auto, ...profileOptions(profiles), ...builtIn, { data: customPreset, label: "Custom" }];
+}
+
+/** A free name for a new profile, from its resolution and frame rate (e.g. "800p 60 FPS"). */
+export function suggestProfileName(): string {
+  const stream = state.settings?.stream;
+  const taken = new Set(Object.values(state.settings?.profiles ?? {}).map((p) => p.name.toLowerCase()));
+  const height = stream?.resolution.split("x")[1];
+  const base = stream && height ? `${height}p ${stream.fps} FPS` : "My profile";
+  if (!taken.has(base.toLowerCase())) return base;
+  for (let n = 2; ; n += 1) {
+    if (!taken.has(`${base} (${n})`.toLowerCase())) return `${base} (${n})`;
+  }
 }
 
 export async function setHostConfig(uuid: string, patch: Patch<HostConfig> | null): Promise<string | null> {

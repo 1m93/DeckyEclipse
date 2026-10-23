@@ -13,7 +13,6 @@ import {
   type GamepadEvent,
 } from "@decky/ui";
 import { forwardRef, useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type Ref } from "react";
-import { FaDesktop, FaSun } from "react-icons/fa";
 import { backend } from "../backend";
 import {
   confirmStopSunshine,
@@ -24,7 +23,9 @@ import {
   installFeature,
   openMoonlight,
   quitHostApp,
+  refreshSunshineOptions,
   repairSunshine,
+  setSunshineOptions,
 } from "../lib/actions";
 import { ACCENT, formatBitrate, formatDuration } from "../lib/format";
 import { openEclipsePage } from "../lib/navigation";
@@ -39,6 +40,7 @@ import {
   refreshIncoming,
   refreshSharing,
   setQuickTab,
+  streamChoices,
   updateStream,
   useStore,
   type QuickTab,
@@ -49,7 +51,9 @@ import { showAddHostModal } from "./AddHostModal";
 import { ButtonRow } from "./ButtonRow";
 import { FeatureSetup, InstallSection } from "./FeatureSetup";
 import { HostRow } from "./HostRow";
+import { PlayIcon, ShareIcon } from "./icons";
 import { InstallProgress } from "./InstallProgress";
+import { ApplyOptionsRow, MAX_BITRATE_OPTIONS, maxBitrateLabel, withCurrent } from "./SunshineOptionsSections";
 import { showSunshinePinModal } from "./SunshinePinModal";
 
 /** How often devices waiting to pair are looked up while the menu is open. */
@@ -329,7 +333,7 @@ function QuickTabs({ playRef, shareRef }: { playRef: Ref<HTMLDivElement>; shareR
               tab="play"
               label="Play"
               hint="LB"
-              icon={<FaDesktop />}
+              icon={<PlayIcon />}
               badge={playing ? ACCENT.play : undefined}
             />
             <TabButton
@@ -337,7 +341,7 @@ function QuickTabs({ playRef, shareRef }: { playRef: Ref<HTMLDivElement>; shareR
               tab="share"
               label="Share"
               hint="RB"
-              icon={<FaSun />}
+              icon={<ShareIcon />}
               badge={sharing === "live" ? ACCENT.share : sharing === "on" ? "#5ba32b" : undefined}
             />
           </Focusable>
@@ -401,12 +405,13 @@ function HostsSection() {
 function QuickStreamSettings() {
   const settings = useStore((s) => s.settings);
   const presets = useStore((s) => s.presets);
+  const profiles = useStore((s) => s.settings?.profiles);
   const customPreset = useStore((s) => s.customPreset);
   const streaming = useStore((s) => s.session !== null && !s.session.pairAddress);
 
   const options = useMemo(
-    () => [...presets.map((p) => ({ data: p.id, label: p.label })), { data: customPreset, label: "Custom" }],
-    [presets, customPreset],
+    () => streamChoices(presets, profiles, customPreset),
+    [presets, profiles, customPreset],
   );
   if (!settings) return null;
   const { stream } = settings;
@@ -416,12 +421,12 @@ function QuickStreamSettings() {
     <PanelSection title="Stream quality">
       <PanelSectionRow>
         <DropdownItem
-          label="Quality"
+          label="Profile"
           description={streaming ? `${summary}. Changes apply to the next stream.` : summary}
           rgOptions={options}
           selectedOption={settings.activePreset}
           onChange={(opt) => {
-            if (opt.data === customPreset) openEclipsePage("stream");
+            if (opt.data === customPreset && settings.activePreset !== customPreset) openEclipsePage("streaming");
             else applyPreset(opt.data);
           }}
         />
@@ -437,8 +442,8 @@ function QuickStreamSettings() {
         />
       </PanelSectionRow>
       <PanelSectionRow>
-        <ButtonItem layout="below" onClick={() => openEclipsePage("stream")}>
-          All stream settings
+        <ButtonItem layout="below" onClick={() => openEclipsePage("streaming")}>
+          All streaming settings
         </ButtonItem>
       </PanelSectionRow>
     </PanelSection>
@@ -509,6 +514,61 @@ function ShareProblems({ status, onFixed }: { status: SunshineStatus; onFixed: (
   );
 }
 
+/** The Sunshine options most often changed, the others are in Settings → Sharing. */
+function QuickShareOptions({ visible, running }: { visible: boolean; running: boolean }) {
+  const options = useStore((s) => s.sunshineOptions);
+
+  useEffect(() => {
+    if (visible) void refreshSunshineOptions();
+  }, [visible, running]);
+
+  if (!options) return null;
+  const { values } = options;
+  return (
+    <PanelSection title="Sharing options">
+      {(options.restarting || (running && options.needsRestart)) && (
+        <PanelSectionRow>
+          <ApplyOptionsRow running={running} />
+        </PanelSectionRow>
+      )}
+      <PanelSectionRow>
+        <DropdownItem
+          label="Maximum bitrate"
+          rgOptions={withCurrent(MAX_BITRATE_OPTIONS, values.max_bitrate, maxBitrateLabel)}
+          selectedOption={values.max_bitrate}
+          onChange={(opt) => void setSunshineOptions({ max_bitrate: opt.data })}
+        />
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ToggleField
+          label="Stream audio"
+          checked={values.stream_audio}
+          onChange={(checked) => void setSunshineOptions({ stream_audio: checked })}
+        />
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ToggleField
+          label="Controllers"
+          checked={values.controller}
+          onChange={(checked) => void setSunshineOptions({ controller: checked })}
+        />
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ToggleField
+          label="Keyboard and mouse"
+          checked={values.keyboard && values.mouse}
+          onChange={(checked) => void setSunshineOptions({ keyboard: checked, mouse: checked })}
+        />
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem layout="below" onClick={() => openEclipsePage("sunshine")}>
+          All sharing settings
+        </ButtonItem>
+      </PanelSectionRow>
+    </PanelSection>
+  );
+}
+
 function ShareTab({ visible }: { visible: boolean }) {
   const { status, pending, busy, refresh, setRunning } = useSunshineStatus(visible);
   const sharing = useStore((s) => s.sharing);
@@ -567,112 +627,115 @@ function ShareTab({ visible }: { visible: boolean }) {
 
   const lingering = running && Boolean(incoming?.appOpen) && incoming?.clients === 0;
   return (
-    <PanelSection title="Share this device">
-      <ShareProblems status={status} onFixed={() => void refresh()} />
-      <PanelSectionRow>
-        <ToggleField
-          label="Sunshine"
-          description={describeSunshine(status, pending)}
-          checked={status.running}
-          disabled={busy || ending}
-          onChange={(checked) =>
-            checked ? void setRunning(true) : confirmStopSunshine(() => void setRunning(false))
-          }
-        />
-      </PanelSectionRow>
-      {status.running && (
+    <>
+      <PanelSection title="Share this device">
+        <ShareProblems status={status} onFixed={() => void refresh()} />
         <PanelSectionRow>
-          <DropdownItem
-            label="Turn off automatically"
-            rgOptions={AUTO_OFF_OPTIONS}
-            selectedOption={autoOff}
-            onChange={(opt) => updateSettings({ sunshine: { autoOff: opt.data } }, 0)}
+          <ToggleField
+            label="Sunshine"
+            description={describeSunshine(status, pending)}
+            checked={status.running}
+            disabled={busy || ending}
+            onChange={(checked) =>
+              checked ? void setRunning(true) : confirmStopSunshine(() => void setRunning(false))
+            }
           />
         </PanelSectionRow>
-      )}
-      {lingering && (
-        <PanelSectionRow>
-          <ButtonItem
-            layout="below"
-            label={`${incoming?.appName ?? "An app"} is still open`}
-            description="No device is connected. A device can resume it, or close it to end the session."
-            disabled={ending}
-            onClick={() => void endIncomingStream()}
-          >
-            {ending ? "Closing..." : "Close app"}
-          </ButtonItem>
-        </PanelSectionRow>
-      )}
-      {running && !hasLogin && (
-        <PanelSectionRow>
-          {needsLogin === null ? (
-            <Field label="Finish setup" description="Checking Sunshine's login..." bottomSeparator="none" />
-          ) : needsLogin ? (
+        {status.running && (
+          <PanelSectionRow>
+            <DropdownItem
+              label="Turn off automatically"
+              rgOptions={AUTO_OFF_OPTIONS}
+              selectedOption={autoOff}
+              onChange={(opt) => updateSettings({ sunshine: { autoOff: opt.data } }, 0)}
+            />
+          </PanelSectionRow>
+        )}
+        {lingering && (
+          <PanelSectionRow>
             <ButtonItem
               layout="below"
-              label="Finish setup"
-              description="Eclipse creates a Sunshine login for you, used to pair devices and end streams from here."
-              disabled={creatingLogin}
-              onClick={async () => {
-                setCreatingLogin(true);
-                try {
-                  if (await createSunshineLoginAuto()) await refresh();
-                } finally {
-                  setCreatingLogin(false);
-                }
-              }}
+              label={`${incoming?.appName ?? "An app"} is still open`}
+              description="No device is connected. A device can resume it, or close it to end the session."
+              disabled={ending}
+              onClick={() => void endIncomingStream()}
             >
-              {creatingLogin ? "Creating..." : "Set up automatically"}
+              {ending ? "Closing..." : "Close app"}
             </ButtonItem>
-          ) : (
+          </PanelSectionRow>
+        )}
+        {running && !hasLogin && (
+          <PanelSectionRow>
+            {needsLogin === null ? (
+              <Field label="Finish setup" description="Checking Sunshine's login..." bottomSeparator="none" />
+            ) : needsLogin ? (
+              <ButtonItem
+                layout="below"
+                label="Finish setup"
+                description="Eclipse creates a Sunshine login for you, used to pair devices and end streams from here."
+                disabled={creatingLogin}
+                onClick={async () => {
+                  setCreatingLogin(true);
+                  try {
+                    if (await createSunshineLoginAuto()) await refresh();
+                  } finally {
+                    setCreatingLogin(false);
+                  }
+                }}
+              >
+                {creatingLogin ? "Creating..." : "Set up automatically"}
+              </ButtonItem>
+            ) : (
+              <ButtonItem
+                layout="below"
+                label="Sunshine login needed"
+                description="Sunshine already has a login. Enter it once so Eclipse can pair devices and end streams."
+                onClick={() => openEclipsePage("sunshine")}
+              >
+                Enter login
+              </ButtonItem>
+            )}
+          </PanelSectionRow>
+        )}
+        {running && (
+          <PanelSectionRow>
+            <Field
+              label={
+                !sharing
+                  ? "Looking up this device's address..."
+                  : sharing.address
+                    ? `This device: ${sharing.address}`
+                    : "No network address"
+              }
+              description={
+                sharing && !sharing.address
+                  ? "Connect to the same Wi-Fi or LAN as the other device."
+                  : "The other device needs Moonlight. On the same network it finds this device on its own; if not, add this address in Moonlight."
+              }
+              bottomSeparator="none"
+            />
+          </PanelSectionRow>
+        )}
+        {running && hasLogin && (
+          <PanelSectionRow>
             <ButtonItem
               layout="below"
-              label="Sunshine login needed"
-              description="Sunshine already has a login. Enter it once so Eclipse can pair devices and end streams."
-              onClick={() => openEclipsePage("sunshine")}
+              description={
+                sharing?.paired == null
+                  ? undefined
+                  : sharing.paired === 0
+                    ? "No paired devices yet."
+                    : `${sharing.paired} paired ${sharing.paired === 1 ? "device" : "devices"}.`
+              }
+              onClick={() => showSunshinePinModal(undefined, () => void refreshSharing())}
             >
-              Enter login
+              Pair a device
             </ButtonItem>
-          )}
-        </PanelSectionRow>
-      )}
-      {running && (
-        <PanelSectionRow>
-          <Field
-            label={
-              !sharing
-                ? "Looking up this device's address..."
-                : sharing.address
-                  ? `This device: ${sharing.address}`
-                  : "No network address"
-            }
-            description={
-              sharing && !sharing.address
-                ? "Connect to the same Wi-Fi or LAN as the other device."
-                : "The other device needs Moonlight. On the same network it finds this device on its own; if not, add this address in Moonlight."
-            }
-            bottomSeparator="none"
-          />
-        </PanelSectionRow>
-      )}
-      {running && hasLogin && (
-        <PanelSectionRow>
-          <ButtonItem
-            layout="below"
-            description={
-              sharing?.paired == null
-                ? undefined
-                : sharing.paired === 0
-                  ? "No paired devices yet."
-                  : `${sharing.paired} paired ${sharing.paired === 1 ? "device" : "devices"}.`
-            }
-            onClick={() => showSunshinePinModal(undefined, () => void refreshSharing())}
-          >
-            Pair a device
-          </ButtonItem>
-        </PanelSectionRow>
-      )}
-    </PanelSection>
+          </PanelSectionRow>
+        )}
+      </PanelSection>
+      {!status.native?.legacy && <QuickShareOptions visible={visible} running={running} />}
+    </>
   );
 }
 
@@ -682,7 +745,7 @@ function Footer({ tab }: { tab: QuickTab }) {
   const canOpenMoonlight = useStore(
     (s) => Boolean(s.settings?.features.moonlight) && (s.moonlight?.installed ?? false),
   );
-  const settings = { label: "Settings", onClick: () => openEclipsePage(tab === "play" ? "hosts" : "sunshine") };
+  const settings = { label: "Settings", onClick: () => openEclipsePage(tab === "play" ? "streaming" : "sunshine") };
   return (
     <PanelSection>
       <PanelSectionRow>
